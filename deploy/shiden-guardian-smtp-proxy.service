@@ -1,0 +1,23 @@
+[Unit]
+Description=Shiden Guardian loopback Postfix proxy
+Requires=shiden-guardian-smtp-proxy.socket postfix.service
+After=postfix.service
+
+[Service]
+Type=simple
+User=shiden-guardian
+Group=shiden-guardian
+ExecStart=/lib/systemd/systemd-socket-proxyd 127.0.0.1:25
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET

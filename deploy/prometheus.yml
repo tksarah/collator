@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    node: tk_sdn_collator
+
+scrape_configs:
+  - job_name: shiden_guardian
+    static_configs:
+      - targets: ["controller:9091"]
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

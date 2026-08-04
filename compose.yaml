@@ -1,0 +1,208 @@
+name: shiden-guardian
+
+x-app-common: &app-common
+  restart: unless-stopped
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+  networks: [backend]
+  env_file: ["${ENV_FILE:-.env}"]
+
+services:
+  caddy:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+      args:
+        NEXT_PUBLIC_SITE_URL: https://${DOMAIN:?DOMAIN is required}
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    ports:
+      - "80:8080"
+      - "443:8443"
+      - "443:8443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    networks: [frontend]
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 160m
+    cpus: 0.40
+
+  api:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: api
+    environment:
+      LISTEN_ADDRESS: :8080
+      DATABASE_URL_FILE: /run/secrets/database_url
+      BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap_token
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      AGENT_OBSERVE_SOCKET: /run/shiden-guardian/observe/agent.sock
+    volumes:
+      - /run/shiden-guardian/observe:/run/shiden-guardian/observe:ro
+    secrets: [database_url, bootstrap_token, encryption_key]
+    group_add:
+      - "${OBSERVE_GID:?OBSERVE_GID is required}"
+      - "${SECRETS_GID:?SECRETS_GID is required}"
+    networks: [frontend, backend]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/api", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 192m
+    cpus: 0.50
+
+  controller:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: controller
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      GEMINI_API_KEY_FILE: /run/secrets/gemini_api_key
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_UNIX_SOCKET: ${SMTP_UNIX_SOCKET:-}
+      SMTP_TLS_MODE: ${SMTP_TLS_MODE:-required}
+      AGENT_OBSERVE_SOCKET: /run/shiden-guardian/observe/agent.sock
+      AGENT_CONTROL_SOCKET: /run/shiden-guardian/control/agent.sock
+    volumes:
+      - /run/shiden-guardian/observe:/run/shiden-guardian/observe:ro
+      - /run/shiden-guardian/control:/run/shiden-guardian/control:ro
+      - /run/shiden-guardian/smtp:/run/shiden-guardian/smtp:ro
+    secrets: [database_url, gemini_api_key, smtp_password]
+    group_add:
+      - "${OBSERVE_GID:?OBSERVE_GID is required}"
+      - "${CONTROL_GID:?CONTROL_GID is required}"
+      - "${SECRETS_GID:?SECRETS_GID is required}"
+    networks: [backend, egress]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/controller", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 224m
+    cpus: 0.60
+
+  prometheus:
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    networks: [backend]
+    depends_on: [controller]
+    healthcheck:
+      test: ["CMD", "/bin/promtool", "check", "healthy", "--url=http://127.0.0.1:9090"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 512m
+    cpus: 0.70
+
+  postgres:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: guardian
+      POSTGRES_USER: guardian
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: Asia/Tokyo
+    secrets: [postgres_password]
+    group_add: ["${SECRETS_GID:?SECRETS_GID is required}"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m", "/run/postgresql:rw,noexec,nosuid,size=16m"]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guardian -d guardian"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 384m
+    cpus: 0.60
+
+  backup:
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    user: "${HOST_UID:?HOST_UID is required}:${HOST_GID:?HOST_GID is required}"
+    environment:
+      PGHOST: postgres
+      PGDATABASE: guardian
+      PGUSER: guardian
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    group_add: ["${SECRETS_GID:?SECRETS_GID is required}"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    networks: [backend]
+    command: ["/bin/sh", "/opt/backup/backup.sh"]
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups
+      - ./deploy/backup.sh:/opt/backup/backup.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 96m
+    cpus: 0.25
+
+networks:
+  frontend:
+    internal: false
+  backend:
+    internal: true
+  egress:
+    internal: false
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  prometheus_data:
+
+secrets:
+  database_url:
+    file: ${SECRETS_DIR:-./secrets}/database_url
+  postgres_password:
+    file: ${SECRETS_DIR:-./secrets}/postgres_password
+  gemini_api_key:
+    file: ${SECRETS_DIR:-./secrets}/gemini_api_key
+  smtp_password:
+    file: ${SECRETS_DIR:-./secrets}/smtp_password
+  bootstrap_token:
+    file: ${SECRETS_DIR:-./secrets}/bootstrap_token
+  encryption_key:
+    file: ${SECRETS_DIR:-./secrets}/encryption_key

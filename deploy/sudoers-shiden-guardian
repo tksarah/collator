@@ -1,0 +1,1 @@
+shiden-guardian ALL=(root) NOPASSWD: /usr/local/libexec/shiden-guardian-restart

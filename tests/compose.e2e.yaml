@@ -1,0 +1,57 @@
+name: shiden-guardian-e2e
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: agent-artifact
+    entrypoint: ["/shiden-guardian-agent"]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      OBSERVE_SOCKET: /run/shiden-guardian/observe/agent.sock
+      CONTROL_SOCKET: /run/shiden-guardian/control/agent.sock
+      STATE_PATH: /state/guard.json
+      LOCK_PATH: /state/automation-disabled
+    volumes:
+      - agent_observe:/run/shiden-guardian/observe
+      - agent_control:/run/shiden-guardian/control
+      - agent_state:/state
+    networks: [backend]
+
+  api:
+    group_add: !override ["0"]
+    volumes: !override
+      - agent_observe:/run/shiden-guardian/observe:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent:
+        condition: service_started
+
+  controller:
+    group_add: !override ["0"]
+    volumes: !override
+      - agent_observe:/run/shiden-guardian/observe:ro
+      - agent_control:/run/shiden-guardian/control:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent:
+        condition: service_started
+
+  caddy:
+    ports: !override
+      - "127.0.0.1:18443:8443"
+
+  backup:
+    volumes: !override
+      - ./work/e2e/backups:/backups
+      - ./deploy/backup.sh:/opt/backup/backup.sh:ro
+
+volumes:
+  agent_observe:
+  agent_control:
+  agent_state:

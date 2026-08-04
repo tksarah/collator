@@ -1,0 +1,42 @@
+[Unit]
+Description=Shiden Guardian least-privilege host agent
+After=network-online.target systemd-journald.service systemd-tmpfiles-setup.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shiden-guardian
+Group=shiden-guardian
+SupplementaryGroups=systemd-journal shiden-guardian-observe shiden-guardian-control
+ExecStart=/usr/local/bin/shiden-guardian-agent
+Restart=always
+RestartSec=10
+UMask=0007
+Environment=SYSTEMD_UNIT=astar.service
+Environment=NODE_NAME=tk_sdn_collator
+Environment=OBSERVE_SOCKET=/run/shiden-guardian/observe/agent.sock
+Environment=CONTROL_SOCKET=/run/shiden-guardian/control/agent.sock
+Environment=STATE_PATH=/var/lib/shiden-guardian/guard.json
+Environment=LOCK_PATH=/etc/shiden-guardian/automation-disabled
+Environment=RESTART_WRAPPER=/usr/local/libexec/shiden-guardian-restart
+Environment=PARACHAIN_METRICS_URL=http://127.0.0.1:9615/metrics
+Environment=RELAY_METRICS_URL=http://127.0.0.1:9616/metrics
+Environment=PARACHAIN_RPC_URL=http://127.0.0.1:9944
+Environment=COLLATOR_REWARD_ADDRESS=WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/shiden-guardian /var/lib/shiden-guardian
+
+[Install]
+WantedBy=multi-user.target

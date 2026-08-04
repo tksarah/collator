@@ -1,0 +1,13 @@
+[Unit]
+Description=Shiden Guardian local Postfix proxy socket
+
+[Socket]
+ListenStream=/run/shiden-guardian/smtp/postfix.sock
+SocketUser=shiden-guardian
+SocketGroup=shiden-guardian-control
+SocketMode=0660
+RemoveOnStop=true
+Service=shiden-guardian-smtp-proxy.service
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,28 @@
+FROM golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go test ./... && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/controller ./cmd/controller && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/shiden-guardian-agent ./cmd/agent
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin guardian
+USER 65532:65532
+
+FROM runtime AS api
+COPY --from=build /out/api /usr/local/bin/api
+ENTRYPOINT ["/usr/local/bin/api"]
+
+FROM runtime AS controller
+COPY --from=build /out/controller /usr/local/bin/controller
+ENTRYPOINT ["/usr/local/bin/controller"]
+
+FROM scratch AS agent-artifact
+COPY --from=build /out/shiden-guardian-agent /shiden-guardian-agent

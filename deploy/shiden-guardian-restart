@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+if [ "$#" -ne 0 ]; then
+  echo "arguments are not permitted" >&2
+  exit 64
+fi
+exec /bin/systemctl restart astar.service
