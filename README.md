@@ -18,11 +18,14 @@ flowchart LR
     browser["運用者のブラウザー"] -->|"HTTPS 443 / 初回ACME 80"| caddy["Caddy\n静的UI・APIプロキシ"]
 
     subgraph compose["Docker Compose"]
-        caddy --> api["Go API\n認証・REST/SSE・監査"]
-        api <--> postgres["PostgreSQL\n設定・履歴・報酬証拠"]
+        caddy --> broker["Auth broker\n認証・step-up"]
+        caddy --> api["Go API\n読み取り・REST/SSE・監査"]
+        broker <--> postgres
+		api <--> postgres["PostgreSQL\n設定・履歴・報酬証拠"]
         api --> prometheus["Prometheus\n30日・最大5 GiB"]
         controller["Go controller\n収集・ルール・診断・通知"] <--> postgres
-        controller --> prometheus
+		broker -->|"署名付きUnix socket"| controller
+		controller --> prometheus
         backup["日次backup"] --> postgres
     end
 
@@ -36,7 +39,7 @@ flowchart LR
     controller -->|"Unix socket → localhost:25"| postfix["Postfix"]
 ```
 
-Composeは`caddy`、`api`、`controller`、`prometheus`、`postgres`、`backup`で構成されます。systemd操作が必要なhost agentだけをUbuntuホストで動かし、WebコンテナへDocker socket、systemd D-Bus、ホストの広いファイルシステム権限を渡しません。
+Composeは`caddy`、`api`、`auth-broker`、`controller`、`prometheus`、`postgres`、`backup`で構成されます。認証情報はCaddyからbrokerへ直接渡り、APIはpassword hash、TOTP secret、暗号鍵、再起動action作成権限を持ちません。systemd操作が必要なhost agentだけをUbuntuホストで動かし、WebコンテナへDocker socket、systemd D-Bus、ホストの広いファイルシステム権限を渡しません。
 
 ## 画面と主な機能
 
@@ -76,7 +79,7 @@ Polkadot Telemetryは状況確認用リンクとして使いますが、その�
 
 SDNは小数18桁で、`1 SDN = 10^18 Planck`です。DBでは`numeric(39,0)`、JSONでは10進文字列を使い、JavaScriptの数値精度損失を避けます。対応済みruntime specは`2208`と`2300`です。未知のruntimeやAccountInfo形式を検出した場合、金額判定を止めてfail-closedで「報酬監視劣化」と通知します。
 
-導入前の履歴は推測しません。Activation時のfinalized blockを開始点として、以降の証拠だけを保存します。controller停止中はDB cursorから再開し、pruning等で補えない区間は監視gapとして残します。外部RPCの429や停止時はバックオフし、「報酬未取得」と誤判定しません。
+導入前の履歴は推測しません。Activation時のfinalized blockを開始点として、以降の証拠だけを保存します。controller停止中はDB cursorから再開し、pruning等で補えない区間は監視gapとして残します。履歴カーソルを進められるのは確定済みローカルRPCだけで、外部RPC単独の結果では進めません。走査は15秒に1回・最大16ブロックの1チャンクに制限し、RPCまたはDB失敗時は15秒から最大5分までbackoffします。報酬イベントのupsertとcursor更新は同一transactionで行い、競合や1件の保存失敗でも全体をrollbackします。外部RPCはsnapshot quorumと異常候補1ブロックの確認だけに使い、429や停止時は1・2・4・8・15分backoffして「報酬未取得」と誤判定しません。
 
 active set所属中かつShiden chainが進行しているとき、最後の確認済み報酬から15分で警告、30分で重大です。active set離脱は2ソースで連続確認後に重大化します。service停止、同期停止、Shiden全体停止中は報酬メールを重複させず、既存インシデントへ「報酬取得リスク」を追加します。
 
@@ -101,7 +104,7 @@ Geminiは安定版モデル`gemini-3.6-flash`を`store=false`、構造化出力�
 
 ## セキュリティ境界
 
-- 公開ポートはCaddyのTCP `80/443`とHTTP/3用UDP `443`だけです。PostgreSQL、Prometheus、API、RPC、9615/9616 metricsは公開しません。
+- Web公開ポートはCaddyのTCP `80/443`とHTTP/3用UDP `443`です。ブロックチェーンP2P用TCP `30333/30334`もルーターで意図的に公開します。PostgreSQL、Prometheus、API、RPC、9615/9616 metricsは公開しません。
 - `80`はHTTPからHTTPSへの転送とACME証明書の発行・更新に使います。HTTP-01を使う現在の構成では、証明書取得後もルーター側で閉じないでください。
 - host agentの観測・制御は`/run/shiden-guardian/observe/agent.sock`と`/run/shiden-guardian/control/agent.sock`に分離します。
 - Postfixは`/run/shiden-guardian/smtp/postfix.sock`経由でホストの`localhost:25`へ接続し、SMTP 25番をコンテナネットワークへ公開しません。
@@ -110,6 +113,8 @@ Geminiは安定版モデル`gemini-3.6-flash`を`store=false`、構造化出力�
 - パスワードはArgon2id、TOTP secretはAES-256-GCM、recovery code・session tokenはhashで保存します。
 - CookieはSecure/HttpOnly/SameSite、セッションは12時間、CSRF対策、ログイン試行制限、セッション失効を実装しています。
 - 設定変更とrestartは再認証し、結果を監査履歴へ記録します。
+- login limiterは全体・IP単位のtoken bucketと上限付きTTL/LRUを使い、アカウント単位のhard lockを行いません。失敗監査は1分単位で集約します。
+- DBはAPI、認証、controller、backupを別roleにし、runtime processへschema ownerや管理credentialを渡しません。
 - Gemini key、DB password、SMTP credential、bootstrap token、暗号鍵は`secrets/`に0600/0640で保存します。`.env`やGitへ秘密値を書きません。
 
 緊急時はホストで次を実行すると、手動・自動を含むWeb経由restartを即座に拒否します。
@@ -136,8 +141,10 @@ sudo touch /etc/shiden-guardian/automation-disabled
 
 ```text
 app/                 Next.js / Reactの日本語UI
-cmd/api/             認証、REST/SSE、ログ、設定、監査
+cmd/api/             最小権限のREST/SSE、ログ、設定読取り、監査
+cmd/authbroker/      bootstrap、login、session、step-up認証
 cmd/controller/      収集、ルール、Gemini、メール、復旧制御
+cmd/dbmigrate/       一回限りのschema・DB role migration
 cmd/agent/           Ubuntuホスト用の最小権限agent
 internal/            認証、DB、報酬、RPC、ルール等のGo package
 deploy/              Dockerfile、Caddy、Prometheus、systemd、sudoers
@@ -147,11 +154,7 @@ secrets/.gitkeep     秘密ディレクトリの空プレースホルダー
 release/             ローカル生成release（Git対象外）
 ```
 
-ローカルで保持する最新成果物は`20260804T173903Z`です。
-
-- `release/shiden-guardian-20260804T173903Z.tar.gz`
-- `release/shiden-guardian-20260804T173903Z.tar.gz.sha256`
-- `release/agent-20260804T173903Z/`
+ローカルの`release/`は、リモートstageが完全に成功した最新1世代だけを保持します。実際のバージョンは固定記載せず、`release/shiden-guardian-<VERSION>.tar.gz`、対応する`.sha256`、`release/agent-<VERSION>/`が同じ`VERSION`で揃っていることを確認します。
 
 これはローカル成果物の情報であり、本番で現在稼働しているreleaseを保証するものではありません。本番は必ず次で確認します。
 
@@ -170,7 +173,7 @@ corepack pnpm install --frozen-lockfile
 代表的な検証は次の順です。
 
 ```sh
-go test ./...
+go test -race ./...
 corepack pnpm run lint
 NEXT_PUBLIC_DEMO_MODE=true corepack pnpm test
 ENV_FILE=.env.example docker compose --env-file .env.example config --quiet
@@ -215,7 +218,9 @@ bash scripts/deploy-wsl.sh
 
 処理順は、読み取り専用preflight、Compose構文確認、linux/amd64 build、agent build、Web build、archive SHA-256生成、SSH転送、リモートSHA-256検証、展開、リモートpreflightです。成功した時だけ、新releaseの手動コマンドを表示します。
 
-ローカルの`release/`は、リモートstageが完全に成功した後だけ厳密な名前の旧成果物を削除し、最新1世代を保持します。stage失敗時は直前の最新版を残します。無関係なファイルと、リモートの`/home/tk/shiden-guardian/releases/`は削除しません。リモートの旧releaseはrollback用です。
+ローカルの`release/`は、リモートstageが完全に成功した後だけ厳密な名前の旧成果物を削除し、最新1世代を保持します。stage失敗時は直前の最新版を残します。無関係なファイルと、リモートの`/home/tk/shiden-guardian/releases/`は自動削除しません。
+
+本番の旧releaseは、切替後監視が完了するまで`current`と直前の既知正常releaseを保持します。監視完了後も通常はこの2世代を残し、それより古い失敗・未採用releaseは削除できます。release directoryには`.env`とruntime secretの複製があるため、不要世代を長期間残しません。削除前に`readlink -f /home/tk/shiden-guardian/current`で稼働中releaseを除外し、timestamp形式に完全一致する実directoryだけを明示的に対象にします。Docker全体のimage・volume・build cache cleanupは別projectへ影響し得るため、このrelease整理では実行しません。
 
 ## 初回導入、更新、Activation
 
@@ -253,7 +258,28 @@ sudo sh /home/tk/shiden-guardian/releases/<VERSION>/scripts/activate-release.sh 
   /home/tk/shiden-guardian <VERSION>
 ```
 
-Activationは設定確認、DB backup、migration dry-run、Compose build/up、全healthcheck、HTTPS検証に成功してから`current` symlinkを切り替えます。途中で失敗した場合は直前のreleaseへComposeとsymlinkを自動で戻します。`astar.service`をActivationの都合で再起動することはありません。
+Activationは設定確認、DBとroleのbackup、migration dry-run、role別の許可・拒否検証を行い、検証成功後にDB管理passwordをローテーションしてからComposeを起動します。passwordローテーション前の失敗だけ直前releaseへ自動rollbackします。ローテーション後は旧管理credentialを再公開せずfix-forwardし、旧releaseへの自動rollbackは行いません。`astar.service`をActivationの都合で再起動することはありません。
+
+DB schema・credential・Compose定義を変更しないcontroller-only更新では、次の専用経路を使います。
+
+```sh
+bash scripts/deploy-wsl.sh --controller-only
+cd /home/tk/shiden-guardian/releases/<VERSION>
+sudo sh scripts/copy-runtime-config.sh /home/tk/shiden-guardian/current
+sudo sh scripts/activate-controller-release.sh /home/tk/shiden-guardian <VERSION>
+```
+
+この経路は現行`.env`とruntime secretを値を表示せずbyte単位で照合し、`migration_database_url`と旧`database_url`を拒否します。旧controllerを稼働させたまま新imageをbuildし、`docker compose up -d --no-deps --force-recreate --wait controller`だけで切り替えます。DB、API、auth-broker、Caddy、Prometheus、backup、host agent、Astarの再作成・再起動を検知すると失敗し、旧controller imageと旧releaseへ自動rollbackします。
+
+ローカルnodeのstate pruningにより未走査履歴がすでに破棄されている場合だけ、運用者の明示承認後に監査付き再基準化を使えます。
+
+```sh
+bash scripts/deploy-wsl.sh --controller-only --acknowledge-pruned-gap
+sudo sh scripts/activate-controller-release.sh \
+  /home/tk/shiden-guardian <VERSION> --acknowledge-pruned-gap
+```
+
+このモードは旧cursorの走査がローカルRPCから`State already discarded`で拒否され、同じローカルRPCの最新保持範囲が正常走査できることを確認してから、controllerだけを停止します。`finalized - 64`を再開基準として、破棄済み区間、再開block、`history_recovered=false`、local RPC権威であることを`reward.history_gap.acknowledge`監査へcursor更新と同一transactionで保存します。破棄済み区間の報酬eventを合成せず、`sources.historical_gap`にも永続的な印を残します。通常走査がRPC失敗時にcursorを進めない規則は変更しません。
 
 ## 日常確認
 
@@ -261,7 +287,7 @@ Activationは設定確認、DB backup、migration dry-run、Compose build/up、�
 readlink -f /home/tk/shiden-guardian/current
 cd /home/tk/shiden-guardian/current
 sudo docker compose ps
-sudo docker compose logs --tail=100 api controller caddy
+sudo docker compose logs --tail=100 api auth-broker controller caddy
 systemctl --no-pager --full status shiden-guardian-agent.service astar.service
 sudo journalctl -u shiden-guardian-agent.service -n 100 --no-pager
 curl --unix-socket /run/shiden-guardian/observe/agent.sock \
@@ -308,4 +334,3 @@ routerのTCP 80/443 forwarding、domainのDNS、Caddy log、外向き通信を�
 - `tk`をDocker groupへ追加したり、広範なpasswordless sudoを許可したりしません。Composeは現在のroot管理を維持します。
 - Docker imageやbuild cacheの全体cleanupは、ほかのprojectへ影響するためこのリポジトリのcleanup対象外です。
 - 実際の障害対応では、Guardianの診断を証拠の一つとして使い、chain全体・network・disk・DBの状況を運用者が確認してください。
-

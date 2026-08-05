@@ -15,11 +15,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/shiden-guardian/shiden-guardian/internal/actionbroker"
 	"github.com/shiden-guardian/shiden-guardian/internal/agentclient"
 	"github.com/shiden-guardian/shiden-guardian/internal/config"
 	"github.com/shiden-guardian/shiden-guardian/internal/gemini"
@@ -46,6 +49,7 @@ type controller struct {
 	autoSeen            map[string]time.Time
 	smtpHealthy         bool
 	actionMu            sync.Mutex
+	actionVerifier      *actionbroker.Verifier
 	lastCleanup         time.Time
 	rewardExternal      []*reward.Monitor
 	rewardExternalState [2]model.RewardSnapshot
@@ -54,6 +58,32 @@ type controller struct {
 	rewardExternalFails [2]int
 	rewardChainHeight   [2]int64
 	rewardChainProgress [2]time.Time
+	rewardScanner       rewardHistoryScanner
+	rewardWriter        rewardHistoryWriter
+	rewardScanNext      time.Time
+	rewardScanFailures  int
+}
+
+const (
+	rewardScanChunkSize = int64(16)
+	rewardScanInterval  = 15 * time.Second
+)
+
+type rewardHistoryScanner interface {
+	RewardScan(context.Context, int64, int64) (model.RewardScan, error)
+}
+
+type rewardHistoryWriter interface {
+	ApplyRewardScan(context.Context, int64, model.RewardOverview, []model.RewardObservation) error
+}
+
+type rewardGapAuthority interface {
+	RewardSnapshot(context.Context) (model.RewardSnapshot, error)
+	RewardScan(context.Context, int64, int64) (model.RewardScan, error)
+}
+
+type rewardGapWriter interface {
+	AcknowledgePrunedRewardGap(context.Context, int64, int64, int64) (store.RewardGapRebase, error)
 }
 
 func main() {
@@ -65,9 +95,21 @@ func main() {
 		connection.Close()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-acknowledge-pruned-reward-gap" {
+		if err := runPrunedRewardGapAcknowledgement(os.Args[2:]); err != nil {
+			slog.Error("pruned reward gap acknowledgement", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("config", "error", err)
+		os.Exit(1)
+	}
+	key, err := actionbroker.DecodeKey(cfg.ActionBrokerKey)
+	if err != nil {
+		slog.Error("action broker key", "error", err)
 		os.Exit(1)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -78,7 +120,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.DB.Close()
-	c := &controller{cfg: cfg, store: db, agent: agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), gemini: gemini.New(cfg.GeminiAPIKey, cfg.GeminiModel), mail: notify.SMTP{Host: cfg.SMTPHost, Port: cfg.SMTPPort, User: cfg.SMTPUser, Password: cfg.SMTPPassword, From: cfg.SMTPFrom, To: cfg.SMTPTo, UnixSocket: cfg.SMTPUnixSocket, TLSMode: cfg.SMTPTLSMode}, autoSeen: map[string]time.Time{}}
+	c := &controller{cfg: cfg, store: db, agent: agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), gemini: gemini.New(cfg.GeminiAPIKey, cfg.GeminiModel), mail: notify.SMTP{Host: cfg.SMTPHost, Port: cfg.SMTPPort, User: cfg.SMTPUser, Password: cfg.SMTPPassword, From: cfg.SMTPFrom, To: cfg.SMTPTo, UnixSocket: cfg.SMTPUnixSocket, TLSMode: cfg.SMTPTLSMode}, autoSeen: map[string]time.Time{}, actionVerifier: actionbroker.NewVerifier(key)}
+	c.rewardScanner = c.agent
+	c.rewardWriter = c.store
 	for i, endpoint := range cfg.ExternalRPC {
 		if i >= 2 {
 			break
@@ -90,9 +134,72 @@ func main() {
 	}
 	_, _ = db.DB.ExecContext(context.Background(), `UPDATE jobs SET status='pending' WHERE status='running' AND created_at < now() - interval '15 minutes'`)
 	_, _ = db.DB.ExecContext(context.Background(), `UPDATE remediation_actions SET status='pending',started_at=NULL WHERE status='running' AND started_at < now() - interval '15 minutes'`)
+	if err := c.startActionBroker(); err != nil {
+		slog.Error("action broker", "error", err)
+		os.Exit(1)
+	}
 	go c.serveMetrics()
 	go c.loop()
 	select {}
+}
+
+func runPrunedRewardGapAcknowledgement(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: controller -acknowledge-pruned-reward-gap EXPECTED_CURSOR")
+	}
+	expectedCursor, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || expectedCursor <= 0 {
+		return fmt.Errorf("invalid expected reward cursor")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	db, err := store.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer db.DB.Close()
+	result, err := acknowledgePrunedRewardGap(ctx, agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), db, expectedCursor)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func acknowledgePrunedRewardGap(ctx context.Context, authority rewardGapAuthority, writer rewardGapWriter, expectedCursor int64) (store.RewardGapRebase, error) {
+	if expectedCursor <= 0 {
+		return store.RewardGapRebase{}, fmt.Errorf("invalid expected reward cursor")
+	}
+	snapshot, err := authority.RewardSnapshot(ctx)
+	if err != nil {
+		return store.RewardGapRebase{}, fmt.Errorf("local finalized reward snapshot: %w", err)
+	}
+	if snapshot.Source != "local" || !snapshot.SchemaOK || snapshot.FinalizedBlock <= 0 || snapshot.FinalizedHash == "" {
+		return store.RewardGapRebase{}, fmt.Errorf("invalid local finalized reward snapshot")
+	}
+	if snapshot.FinalizedBlock-expectedCursor <= store.RewardGapRetainedWindowBlocks {
+		return store.RewardGapRebase{}, fmt.Errorf("reward cursor is still within the retained recovery window")
+	}
+	discardedTo := min(expectedCursor+rewardScanChunkSize, snapshot.FinalizedBlock)
+	if _, discardedErr := authority.RewardScan(ctx, expectedCursor+1, discardedTo); discardedErr == nil {
+		return store.RewardGapRebase{}, fmt.Errorf("reward history is readable; acknowledgement is not permitted")
+	} else if !strings.Contains(strings.ToLower(discardedErr.Error()), "state already discarded") {
+		return store.RewardGapRebase{}, fmt.Errorf("reward history failed for a reason other than local state pruning: %w", discardedErr)
+	}
+	baseline := snapshot.FinalizedBlock - store.RewardGapRetainedWindowBlocks
+	probeFrom := baseline + 1
+	probeTo := min(probeFrom+rewardScanChunkSize-1, snapshot.FinalizedBlock)
+	probe, err := authority.RewardScan(ctx, probeFrom, probeTo)
+	if err != nil {
+		return store.RewardGapRebase{}, fmt.Errorf("retained local reward scan: %w", err)
+	}
+	if err := validateLocalRewardScan(probe, probeFrom, probeTo); err != nil {
+		return store.RewardGapRebase{}, fmt.Errorf("retained local reward scan validation: %w", err)
+	}
+	return writer.AcknowledgePrunedRewardGap(ctx, expectedCursor, baseline, snapshot.FinalizedBlock)
 }
 
 func (c *controller) loop() {
@@ -190,7 +297,6 @@ func (c *controller) cleanupRetention(ctx context.Context) {
 		return
 	}
 	c.lastCleanup = time.Now()
-	_, _ = c.store.DB.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < now()`)
 	_, _ = c.store.DB.ExecContext(ctx, `DELETE FROM jobs WHERE finished_at < now() - interval '30 days'`)
 	_, _ = c.store.DB.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < now() - interval '365 days'`)
 	_, _ = c.store.DB.ExecContext(ctx, `DELETE FROM remediation_actions WHERE created_at < now() - interval '365 days'`)
@@ -216,7 +322,7 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 		}
 	} else if stateErr != nil {
 		state.Rewards = model.RewardOverview{Address: c.cfg.RewardAddress, Status: "unknown", Sources: map[string]string{"database": "unavailable"}, Gap: stateErr.Error()}
-		return []rules.Signal{{Fingerprint: "reward-monitor-degraded", Severity: "warning", Title: "報酬監視データベースを利用できません", AutoCandidate: false, Evidence: map[string]any{"error": stateErr.Error()}}}
+		return []rules.Signal{rewardSignal("reward-monitor-degraded", "warning", "報酬監視データベースを利用できません", map[string]any{"error": stateErr.Error()})}
 	}
 	if previous.Sources == nil {
 		previous.Sources = map[string]string{}
@@ -226,7 +332,6 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 		previous.Sources["local"] = "unavailable"
 		previous.Gap = localErr.Error()
 	} else {
-		previous.Gap = ""
 		if local.SchemaOK {
 			previous.Sources["local"] = "ok"
 		} else {
@@ -242,7 +347,7 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 	}
 
 	for i := range c.rewardExternal {
-		if !c.rewardExternalRetry[i].IsZero() && now.Before(c.rewardExternalRetry[i]) {
+		if !c.rewardExternalReady(i, now) {
 			continue
 		}
 		if c.rewardExternalOK[i] && now.Sub(c.rewardExternalState[i].ObservedAt) < time.Minute {
@@ -253,8 +358,7 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 		cancel()
 		c.rewardExternalOK[i] = err == nil
 		if err == nil {
-			c.rewardExternalFails[i] = 0
-			c.rewardExternalRetry[i] = now.Add(time.Minute)
+			c.recordRewardExternalSuccess(i, now)
 			c.rewardExternalState[i] = snapshot
 			if snapshot.SchemaOK {
 				previous.Sources[fmt.Sprintf("external_%d", i+1)] = "ok"
@@ -262,9 +366,12 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 				previous.Sources[fmt.Sprintf("external_%d", i+1)] = "unsupported_runtime"
 			}
 		} else {
-			c.rewardExternalFails[i]++
-			backoff := rewardRetryBackoff(c.rewardExternalFails[i])
-			c.rewardExternalRetry[i] = now.Add(backoff)
+			c.recordRewardExternalFailure(i, now)
+			previous.Sources[fmt.Sprintf("external_%d", i+1)] = "unavailable"
+		}
+	}
+	for i := range c.rewardExternal {
+		if !c.rewardExternalOK[i] {
 			previous.Sources[fmt.Sprintf("external_%d", i+1)] = "unavailable"
 		}
 	}
@@ -285,29 +392,18 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 	}
 
 	if localErr == nil && previous.LastScannedBlock > 0 && local.FinalizedBlock > previous.LastScannedBlock {
-		cursor := previous.LastScannedBlock + 1
-		for cursor <= local.FinalizedBlock {
-			end := min(cursor+127, local.FinalizedBlock)
-			scan, err := c.agent.RewardScan(ctx, cursor, end)
-			if err != nil {
-				scan, err = c.scanRewardFallback(ctx, cursor, end)
-			}
-			if err != nil {
-				previous.Gap = fmt.Sprintf("blocks %d-%d: %v", cursor, end, err)
-				break
-			}
-			for _, observation := range scan.Observations {
-				if observation.Verification == "insufficient" || observation.Verification == "pot_empty" {
-					c.confirmRewardAnomaly(ctx, &observation)
-				}
-				_ = c.store.SaveRewardObservation(ctx, observation)
-				previous.LastAuthoredBlock = observation.BlockNumber
-				previous.LastRewardAt = observation.AuthoredAt
-				previous.LastRewardPlanck = observation.CreditedPlanck
-			}
-			previous.LastScannedBlock = end
-			cursor = end + 1
+		updated, attempted, scanErr := c.scanLocalRewardHistory(ctx, now, previous, local.FinalizedBlock)
+		if scanErr != nil {
+			cursor := previous.LastScannedBlock + 1
+			end := min(cursor+rewardScanChunkSize-1, local.FinalizedBlock)
+			previous.Gap = fmt.Sprintf("blocks %d-%d: %v", cursor, end, scanErr)
+		} else if attempted {
+			previous = updated
 		}
+	} else if localErr == nil && local.FinalizedBlock < previous.LastScannedBlock {
+		previous.Gap = fmt.Sprintf("local finalized block %d is behind reward cursor %d", local.FinalizedBlock, previous.LastScannedBlock)
+	} else if localErr == nil {
+		previous.Gap = ""
 	}
 	if localErr == nil && previous.LastScannedBlock == 0 {
 		previous.LastScannedBlock = local.FinalizedBlock
@@ -337,35 +433,139 @@ func rewardRetryBackoff(failures int) time.Duration {
 	return backoff
 }
 
-func (c *controller) scanRewardFallback(ctx context.Context, from, to int64) (model.RewardScan, error) {
-	var lastErr error
-	for i, monitor := range c.rewardExternal {
-		scanCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		scan, err := monitor.Scan(scanCtx, from, to)
-		cancel()
-		if err == nil {
-			c.rewardExternalOK[i] = true
-			return scan, nil
+func rewardScanRetryBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	backoff := rewardScanInterval * time.Duration(1<<min(failures-1, 5))
+	if backoff > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return backoff
+}
+
+func (c *controller) rewardExternalReady(index int, now time.Time) bool {
+	return index >= 0 && index < len(c.rewardExternalRetry) && (c.rewardExternalRetry[index].IsZero() || !now.Before(c.rewardExternalRetry[index]))
+}
+
+func (c *controller) recordRewardExternalSuccess(index int, now time.Time) {
+	if index < 0 || index >= len(c.rewardExternalRetry) {
+		return
+	}
+	c.rewardExternalOK[index] = true
+	c.rewardExternalFails[index] = 0
+	c.rewardExternalRetry[index] = now.Add(time.Minute)
+}
+
+func (c *controller) recordRewardExternalFailure(index int, now time.Time) {
+	if index < 0 || index >= len(c.rewardExternalRetry) {
+		return
+	}
+	c.rewardExternalOK[index] = false
+	c.rewardExternalFails[index]++
+	c.rewardExternalRetry[index] = now.Add(rewardRetryBackoff(c.rewardExternalFails[index]))
+}
+
+func validateLocalRewardScan(scan model.RewardScan, from, to int64) error {
+	if scan.Source != "local" || scan.From != from || scan.To != to {
+		return fmt.Errorf("invalid local reward scan envelope")
+	}
+	seen := make(map[int64]struct{}, len(scan.Observations))
+	for _, observation := range scan.Observations {
+		if observation.BlockNumber < from || observation.BlockNumber > to || observation.BlockHash == "" || observation.SourceCount != 1 {
+			return fmt.Errorf("invalid local reward observation")
 		}
-		lastErr = err
+		switch observation.Verification {
+		case "confirmed", "confirmed_extra", "insufficient", "pot_empty":
+		default:
+			return fmt.Errorf("invalid local reward verification")
+		}
+		if _, exists := seen[observation.BlockNumber]; exists {
+			return fmt.Errorf("duplicate local reward observation")
+		}
+		seen[observation.BlockNumber] = struct{}{}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no reward RPC source")
+	return nil
+}
+
+// scanLocalRewardHistory processes at most one bounded chunk. Only the local
+// finalized RPC and an atomic database commit may advance the durable cursor.
+func (c *controller) scanLocalRewardHistory(ctx context.Context, now time.Time, previous model.RewardOverview, finalized int64) (model.RewardOverview, bool, error) {
+	if previous.LastScannedBlock <= 0 || finalized <= previous.LastScannedBlock {
+		return previous, false, nil
 	}
-	return model.RewardScan{}, lastErr
+	if !c.rewardScanNext.IsZero() && now.Before(c.rewardScanNext) {
+		return previous, false, nil
+	}
+	from := previous.LastScannedBlock + 1
+	to := min(from+rewardScanChunkSize-1, finalized)
+	if c.rewardScanner == nil || c.rewardWriter == nil {
+		return previous, true, c.failRewardScan(now, fmt.Errorf("reward history dependency unavailable"))
+	}
+	scan, err := c.rewardScanner.RewardScan(ctx, from, to)
+	if err != nil {
+		return previous, true, c.failRewardScan(now, err)
+	}
+	if err := validateLocalRewardScan(scan, from, to); err != nil {
+		return previous, true, c.failRewardScan(now, err)
+	}
+	next := previous
+	for index := range scan.Observations {
+		observation := &scan.Observations[index]
+		if observation.Verification == "insufficient" || observation.Verification == "pot_empty" {
+			c.confirmRewardAnomaly(ctx, observation)
+		}
+		if observation.BlockNumber > next.LastAuthoredBlock {
+			next.LastAuthoredBlock = observation.BlockNumber
+		}
+		if observation.AuthoredAt.After(next.LastRewardAt) {
+			next.LastRewardAt = observation.AuthoredAt
+			next.LastRewardPlanck = observation.CreditedPlanck
+		}
+	}
+	next.LastScannedBlock = to
+	if to < finalized {
+		next.Gap = fmt.Sprintf("catching up after block %d", to)
+	} else {
+		next.Gap = ""
+	}
+	if err := c.rewardWriter.ApplyRewardScan(ctx, previous.LastScannedBlock, next, scan.Observations); err != nil {
+		return previous, true, c.failRewardScan(now, err)
+	}
+	c.rewardScanFailures = 0
+	c.rewardScanNext = now.Add(rewardScanInterval)
+	return next, true, nil
+}
+
+func (c *controller) failRewardScan(now time.Time, err error) error {
+	c.rewardScanFailures++
+	c.rewardScanNext = now.Add(rewardScanRetryBackoff(c.rewardScanFailures))
+	return err
 }
 
 func (c *controller) confirmRewardAnomaly(ctx context.Context, observation *model.RewardObservation) {
+	now := time.Now()
 	for i, monitor := range c.rewardExternal {
+		if !c.rewardExternalReady(i, now) {
+			continue
+		}
 		scanCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		scan, err := monitor.Scan(scanCtx, observation.BlockNumber, observation.BlockNumber)
 		cancel()
-		if err != nil || len(scan.Observations) != 1 {
+		if err != nil {
+			c.recordRewardExternalFailure(i, now)
+			continue
+		}
+		c.recordRewardExternalSuccess(i, now)
+		if len(scan.Observations) != 1 {
 			continue
 		}
 		x := scan.Observations[0]
 		if x.BlockHash == observation.BlockHash && x.ExpectedPlanck == observation.ExpectedPlanck && x.CreditedPlanck == observation.CreditedPlanck && x.Verification == observation.Verification {
 			observation.SourceCount++
+			if observation.Evidence == nil {
+				observation.Evidence = map[string]any{}
+			}
 			observation.Evidence[fmt.Sprintf("external_%d", i+1)] = "matched"
 		}
 	}
@@ -393,16 +593,16 @@ func rewardStatus(x model.RewardOverview, warningAfter, criticalAfter time.Durat
 
 func (c *controller) rewardSignals(ctx context.Context, x model.RewardOverview, state model.Overview) []rules.Signal {
 	if !x.SchemaOK || x.Gap != "" || x.Quorum < 2 {
-		return []rules.Signal{{Fingerprint: "reward-monitor-degraded", Severity: "warning", Title: "報酬監視の証拠が不足しています", AutoCandidate: false, Evidence: map[string]any{"schema_ok": x.SchemaOK, "quorum": x.Quorum, "gap": x.Gap, "sources": x.Sources}}}
+		return []rules.Signal{rewardSignal("reward-monitor-degraded", "warning", "報酬監視の証拠が不足しています", map[string]any{"schema_ok": x.SchemaOK, "quorum": x.Quorum, "gap": x.Gap, "sources": x.Sources})}
 	}
 	if !x.ActiveSession && x.InactiveConfirmations >= 2 {
-		return []rules.Signal{{Fingerprint: "reward-active-set-missing", Severity: "critical", Title: "報酬ウォレットがactive setに含まれていません", AutoCandidate: false, Evidence: map[string]any{"address": x.Address, "validator_count": x.ValidatorCount, "quorum": x.Quorum}}}
+		return []rules.Signal{rewardSignal("reward-active-set-missing", "critical", "報酬ウォレットがactive setに含まれていません", map[string]any{"address": x.Address, "validator_count": x.ValidatorCount, "quorum": x.Quorum})}
 	}
 	items, err := c.store.RewardPage(ctx, 5, 0)
 	if err == nil {
 		for _, item := range items {
 			if (item.Verification == "insufficient" || item.Verification == "pot_empty") && item.SourceCount >= 2 {
-				return []rules.Signal{{Fingerprint: "reward-credit-mismatch", Severity: "critical", Title: "作成blockに対応する報酬入金が不足しています", AutoCandidate: false, Evidence: map[string]any{"block": item.BlockNumber, "expected_planck": item.ExpectedPlanck, "credited_planck": item.CreditedPlanck, "verification": item.Verification, "sources": item.SourceCount}}}
+				return []rules.Signal{rewardSignal("reward-credit-mismatch", "critical", "作成blockに対応する報酬入金が不足しています", map[string]any{"block": item.BlockNumber, "expected_planck": item.ExpectedPlanck, "credited_planck": item.CreditedPlanck, "verification": item.Verification, "sources": item.SourceCount})}
 			}
 		}
 	}
@@ -413,12 +613,16 @@ func (c *controller) rewardSignals(ctx context.Context, x model.RewardOverview, 
 		return nil
 	}
 	if x.Status == "critical" {
-		return []rules.Signal{{Fingerprint: "reward-silence", Severity: "critical", Title: "ブロック生成報酬が30分以上確認できません", AutoCandidate: false, Evidence: map[string]any{"last_authored_block": x.LastAuthoredBlock, "seconds": x.SecondsSinceReward, "blocks_since": x.BlocksSinceAuthored}}}
+		return []rules.Signal{rewardSignal("reward-silence", "critical", "ブロック生成報酬が30分以上確認できません", map[string]any{"last_authored_block": x.LastAuthoredBlock, "seconds": x.SecondsSinceReward, "blocks_since": x.BlocksSinceAuthored})}
 	}
 	if x.Status == "warning" {
-		return []rules.Signal{{Fingerprint: "reward-silence", Severity: "warning", Title: "ブロック生成報酬が15分以上確認できません", AutoCandidate: false, Evidence: map[string]any{"last_authored_block": x.LastAuthoredBlock, "seconds": x.SecondsSinceReward, "blocks_since": x.BlocksSinceAuthored}}}
+		return []rules.Signal{rewardSignal("reward-silence", "warning", "ブロック生成報酬が15分以上確認できません", map[string]any{"last_authored_block": x.LastAuthoredBlock, "seconds": x.SecondsSinceReward, "blocks_since": x.BlocksSinceAuthored})}
 	}
 	return nil
+}
+
+func rewardSignal(fingerprint, severity, title string, evidence map[string]any) rules.Signal {
+	return rules.Signal{Fingerprint: fingerprint, Severity: severity, Title: title, AutoCandidate: false, Evidence: evidence}
 }
 
 func (c *controller) rewardChainProgressing(now time.Time) bool {
@@ -614,6 +818,85 @@ func (c *controller) processJobs(ctx context.Context) {
 	_, _ = c.store.DB.ExecContext(ctx, `UPDATE jobs SET status=$2,finished_at=now() WHERE id=$1`, id, status)
 	c.store.Audit(ctx, "job."+kind, "controller", status, map[string]any{"job_id": id, "error": errorString(err)})
 }
+
+var manualActionIDPattern = regexp.MustCompile(`^act_[A-Za-z0-9_-]{16,100}$`)
+
+func (c *controller) startActionBroker() error {
+	path := c.cfg.ActionBrokerSock
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0660); err != nil {
+		listener.Close()
+		return err
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeControllerJSON(w, 200, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("POST /v1/manual-actions", c.manualAction)
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, MaxHeaderBytes: 16 << 10}
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("action broker server", "error", err)
+		}
+	}()
+	return nil
+}
+
+func writeControllerJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func (c *controller) manualAction(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, actionbroker.MaxBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeControllerJSON(w, 400, actionbroker.Result{Error: "invalid_request"})
+		return
+	}
+	if err := c.actionVerifier.Verify(r.Header, body); err != nil {
+		c.store.Audit(r.Context(), "restart.broker", "controller", "denied", map[string]string{"reason": err.Error()})
+		writeControllerJSON(w, 401, actionbroker.Result{Error: "broker_authentication_failed"})
+		return
+	}
+	var action actionbroker.ManualAction
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&action) != nil || decoder.Decode(&struct{}{}) != io.EOF || !manualActionIDPattern.MatchString(action.ActionID) || len(action.IdempotencyKey) < 1 || len(action.IdempotencyKey) > 100 || strings.TrimSpace(action.RequestedBy) == "" || len(strings.TrimSpace(action.Reason)) < 10 || len(strings.TrimSpace(action.Reason)) > 1000 {
+		writeControllerJSON(w, 400, actionbroker.Result{Error: "invalid_request"})
+		return
+	}
+	action.Reason = strings.TrimSpace(action.Reason)
+	action.RequestedBy = strings.TrimSpace(action.RequestedBy)
+	action.IncidentID = strings.TrimSpace(action.IncidentID)
+	var id string
+	err = c.store.DB.QueryRowContext(r.Context(), `INSERT INTO remediation_actions(id,idempotency_key,incident_id,requested_by,reason,mode,status) VALUES($1,$2,NULLIF($3,''),$4,$5,'manual','pending') ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, action.ActionID, action.IdempotencyKey, action.IncidentID, action.RequestedBy, action.Reason).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		var incidentID, requestedBy, reason string
+		err = c.store.DB.QueryRowContext(r.Context(), `SELECT id,COALESCE(incident_id,''),requested_by,reason FROM remediation_actions WHERE idempotency_key=$1`, action.IdempotencyKey).Scan(&id, &incidentID, &requestedBy, &reason)
+		if err == nil && (incidentID != action.IncidentID || requestedBy != action.RequestedBy || reason != action.Reason) {
+			writeControllerJSON(w, 409, actionbroker.Result{Error: "idempotency_conflict"})
+			return
+		}
+	}
+	if err != nil {
+		writeControllerJSON(w, 500, actionbroker.Result{Error: "database"})
+		return
+	}
+	c.store.Audit(r.Context(), "restart.manual.queue", action.RequestedBy, "queued", map[string]string{"action_id": id})
+	writeControllerJSON(w, 202, actionbroker.Result{ID: id, Status: "pending"})
+}
+
 func (c *controller) processPendingAction() {
 	if !c.actionMu.TryLock() {
 		return

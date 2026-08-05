@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+deploy_mode="full"
+acknowledge_pruned_gap=0
+while (( $# > 0 )); do
+  case "$1" in
+    --controller-only) deploy_mode="controller-only" ;;
+    --acknowledge-pruned-gap) acknowledge_pruned_gap=1 ;;
+    *) printf 'Usage: %s [--controller-only [--acknowledge-pruned-gap]]\n' "$0" >&2; exit 64 ;;
+  esac
+  shift
+done
+if (( acknowledge_pruned_gap == 1 )) && [[ "$deploy_mode" != "controller-only" ]]; then
+  printf 'ERROR: --acknowledge-pruned-gap requires --controller-only.\n' >&2
+  exit 64
+fi
+
 ssh_target="${SHIDEN_SSH_TARGET:-shiden-collator}"
 remote_root="${SHIDEN_REMOTE_ROOT:-/home/tk/shiden-guardian}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -106,6 +121,16 @@ fi
 printf '\nRelease staged and agent artifact built: %s/releases/%s\n' "$remote_root" "$version"
 printf 'Keep your password-authenticated SSH session open. Review and run there:\n'
 printf "  cd '%s/releases/%s'\n" "$remote_root" "$version"
+if [[ "$deploy_mode" == "controller-only" ]]; then
+  printf "  sudo sh scripts/copy-runtime-config.sh '%s/current'\n" "$remote_root"
+  if (( acknowledge_pruned_gap == 1 )); then
+    printf "  sudo sh scripts/activate-controller-release.sh '%s' '%s' --acknowledge-pruned-gap\n" "$remote_root" "$version"
+  else
+    printf "  sudo sh scripts/activate-controller-release.sh '%s' '%s'\n" "$remote_root" "$version"
+  fi
+  printf '\nController-only mode preserves runtime credentials and does not run DB migration or host bootstrap.\n'
+  exit 0
+fi
 if ssh -o BatchMode=yes "$ssh_target" "test -L '$remote_root/current'"; then
   printf "  sudo sh scripts/migrate-release-config.sh '%s/current'\n" "$remote_root"
 else

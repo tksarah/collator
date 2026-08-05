@@ -31,9 +31,11 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
-    networks: [frontend]
+    networks: [frontend, api_proxy, auth_proxy]
     depends_on:
       api:
+        condition: service_healthy
+      auth-broker:
         condition: service_healthy
     mem_limit: 160m
     cpus: 0.40
@@ -46,17 +48,15 @@ services:
       target: api
     environment:
       LISTEN_ADDRESS: :8080
-      DATABASE_URL_FILE: /run/secrets/database_url
-      BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap_token
-      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      DATABASE_URL_FILE: /run/secrets/api_database_url
       AGENT_OBSERVE_SOCKET: /run/shiden-guardian/observe/agent.sock
     volumes:
       - /run/shiden-guardian/observe:/run/shiden-guardian/observe:ro
-    secrets: [database_url, bootstrap_token, encryption_key]
+    secrets: [api_database_url]
     group_add:
       - "${OBSERVE_GID:?OBSERVE_GID is required}"
       - "${SECRETS_GID:?SECRETS_GID is required}"
-    networks: [frontend, backend]
+    networks: [api_proxy, backend]
     healthcheck:
       test: ["CMD", "/usr/local/bin/api", "-healthcheck"]
       interval: 30s
@@ -68,6 +68,38 @@ services:
     mem_limit: 192m
     cpus: 0.50
 
+  auth-broker:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: auth-broker
+    environment:
+      LISTEN_ADDRESS: :8081
+      DATABASE_URL_FILE: /run/secrets/auth_database_url
+      BOOTSTRAP_TOKEN_FILE: /run/secrets/bootstrap_token
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      ACTION_BROKER_KEY_FILE: /run/secrets/action_broker_key
+      ACTION_BROKER_SOCKET: /run/shiden-guardian/action-broker/controller.sock
+    volumes:
+      - action_broker_socket:/run/shiden-guardian/action-broker:ro
+    secrets: [auth_database_url, bootstrap_token, encryption_key, action_broker_key]
+    group_add:
+      - "${SECRETS_GID:?SECRETS_GID is required}"
+    networks: [auth_proxy, auth_db]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/auth-broker", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      controller:
+        condition: service_started
+    mem_limit: 256m
+    cpus: 0.75
+
   controller:
     <<: *app-common
     build:
@@ -75,18 +107,21 @@ services:
       dockerfile: deploy/Dockerfile.backend
       target: controller
     environment:
-      DATABASE_URL_FILE: /run/secrets/database_url
+      DATABASE_URL_FILE: /run/secrets/controller_database_url
       GEMINI_API_KEY_FILE: /run/secrets/gemini_api_key
       SMTP_PASSWORD_FILE: /run/secrets/smtp_password
       SMTP_UNIX_SOCKET: ${SMTP_UNIX_SOCKET:-}
       SMTP_TLS_MODE: ${SMTP_TLS_MODE:-required}
       AGENT_OBSERVE_SOCKET: /run/shiden-guardian/observe/agent.sock
       AGENT_CONTROL_SOCKET: /run/shiden-guardian/control/agent.sock
+      ACTION_BROKER_KEY_FILE: /run/secrets/action_broker_key
+      ACTION_BROKER_SOCKET: /run/shiden-guardian/action-broker/controller.sock
     volumes:
       - /run/shiden-guardian/observe:/run/shiden-guardian/observe:ro
       - /run/shiden-guardian/control:/run/shiden-guardian/control:ro
       - /run/shiden-guardian/smtp:/run/shiden-guardian/smtp:ro
-    secrets: [database_url, gemini_api_key, smtp_password]
+      - action_broker_socket:/run/shiden-guardian/action-broker
+    secrets: [controller_database_url, gemini_api_key, smtp_password, action_broker_key]
     group_add:
       - "${OBSERVE_GID:?OBSERVE_GID is required}"
       - "${CONTROL_GID:?CONTROL_GID is required}"
@@ -144,7 +179,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     tmpfs: ["/tmp:rw,noexec,nosuid,size=64m", "/run/postgresql:rw,noexec,nosuid,size=16m"]
-    networks: [backend]
+    networks: [backend, auth_db]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U guardian -d guardian"]
       interval: 10s
@@ -163,9 +198,9 @@ services:
     environment:
       PGHOST: postgres
       PGDATABASE: guardian
-      PGUSER: guardian
-      PGPASSWORD_FILE: /run/secrets/postgres_password
-    secrets: [postgres_password]
+      PGUSER: guardian_backup
+      PGPASSWORD_FILE: /run/secrets/backup_password
+    secrets: [backup_password]
     group_add: ["${SECRETS_GID:?SECRETS_GID is required}"]
     tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
     networks: [backend]
@@ -179,9 +214,39 @@ services:
     mem_limit: 96m
     cpus: 0.25
 
+  dbmigrate:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: dbmigrate
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      MIGRATION_DATABASE_URL_FILE: /run/secrets/migration_database_url
+      API_DATABASE_URL_FILE: /run/secrets/api_database_url
+      AUTH_DATABASE_URL_FILE: /run/secrets/auth_database_url
+      CONTROLLER_DATABASE_URL_FILE: /run/secrets/controller_database_url
+      BACKUP_PASSWORD_FILE: /run/secrets/backup_password
+      POSTGRES_NEW_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [migration_database_url, api_database_url, auth_database_url, controller_database_url, backup_password, postgres_password]
+    group_add: ["${SECRETS_GID:?SECRETS_GID is required}"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    networks: [backend]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 networks:
   frontend:
     internal: false
+  api_proxy:
+    internal: true
+  auth_proxy:
+    internal: true
+  auth_db:
+    internal: true
   backend:
     internal: true
   egress:
@@ -192,10 +257,19 @@ volumes:
   caddy_config:
   postgres_data:
   prometheus_data:
+  action_broker_socket:
 
 secrets:
-  database_url:
-    file: ${SECRETS_DIR:-./secrets}/database_url
+  migration_database_url:
+    file: ${SECRETS_DIR:-./secrets}/migration_database_url
+  api_database_url:
+    file: ${SECRETS_DIR:-./secrets}/api_database_url
+  auth_database_url:
+    file: ${SECRETS_DIR:-./secrets}/auth_database_url
+  controller_database_url:
+    file: ${SECRETS_DIR:-./secrets}/controller_database_url
+  backup_password:
+    file: ${SECRETS_DIR:-./secrets}/backup_password
   postgres_password:
     file: ${SECRETS_DIR:-./secrets}/postgres_password
   gemini_api_key:
@@ -206,3 +280,5 @@ secrets:
     file: ${SECRETS_DIR:-./secrets}/bootstrap_token
   encryption_key:
     file: ${SECRETS_DIR:-./secrets}/encryption_key
+  action_broker_key:
+    file: ${SECRETS_DIR:-./secrets}/action_broker_key

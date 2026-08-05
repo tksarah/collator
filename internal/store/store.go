@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,13 @@ import (
 )
 
 type Store struct{ DB *sql.DB }
+
+const RewardGapRetainedWindowBlocks int64 = 64
+
+var (
+	ErrRewardCursorConflict    = errors.New("reward cursor conflict")
+	ErrRewardBlockHashConflict = errors.New("reward block hash conflict")
+)
 
 func Open(ctx context.Context, url string) (*Store, error) {
 	db, err := sql.Open("pgx", url)
@@ -26,9 +34,16 @@ func Open(ctx context.Context, url string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	s := &Store{DB: db}
+	return &Store{DB: db}, nil
+}
+
+func OpenAndMigrate(ctx context.Context, url string) (*Store, error) {
+	s, err := Open(ctx, url)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.Migrate(ctx); err != nil {
-		db.Close()
+		s.DB.Close()
 		return nil, err
 	}
 	return s, nil
@@ -43,7 +58,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(834733101)`); err != nil {
 		return fmt.Errorf("migration lock: %w", err)
 	}
-	for _, statement := range migrationStatements() {
+	for _, statement := range MigrationStatements() {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migration: %w", err)
 		}
@@ -51,7 +66,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return tx.Commit()
 }
 
-func migrationStatements() []string {
+func MigrationStatements() []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS users (id text PRIMARY KEY, username text UNIQUE NOT NULL, password_hash text NOT NULL, totp_secret text NOT NULL, recovery_hashes jsonb NOT NULL DEFAULT '[]', active boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now())`,
 		`CREATE TABLE IF NOT EXISTS sessions (token_hash text PRIMARY KEY, user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE, csrf_hash text NOT NULL, expires_at timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now())`,
@@ -86,7 +101,7 @@ func DryRunMigrations(ctx context.Context, url string) error {
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(834733101)`); err != nil {
 		return fmt.Errorf("migration dry-run lock: %w", err)
 	}
-	for _, statement := range migrationStatements() {
+	for _, statement := range MigrationStatements() {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migration dry-run: %w", err)
 		}
@@ -94,8 +109,21 @@ func DryRunMigrations(ctx context.Context, url string) error {
 	return tx.Rollback()
 }
 
-func ID(prefix string) string { token, _ := auth.RandomToken(12); return prefix + "_" + token }
-func JSON(value any) []byte   { data, _ := json.Marshal(value); return data }
+func NewID(prefix string) (string, error) {
+	token, err := auth.RandomToken(12)
+	if err != nil {
+		return "", err
+	}
+	return prefix + "_" + token, nil
+}
+func ID(prefix string) string {
+	id, err := NewID(prefix)
+	if err != nil {
+		panic("secure random source unavailable: " + err.Error())
+	}
+	return id
+}
+func JSON(value any) []byte { data, _ := json.Marshal(value); return data }
 
 func (s *Store) SaveOverview(ctx context.Context, overview model.Overview) error {
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO runtime_state(id,payload,updated_at) VALUES(1,$1,now()) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=now()`, JSON(overview))
@@ -220,11 +248,152 @@ func (s *Store) LoadRewardOverview(ctx context.Context) (model.RewardOverview, e
 }
 
 func (s *Store) SaveRewardObservation(ctx context.Context, x model.RewardObservation) error {
+	return upsertRewardObservation(ctx, s.DB, x)
+}
+
+type rewardObservationExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+type RewardGapRebase struct {
+	AuditID                string `json:"audit_id"`
+	FromBlock              int64  `json:"from_block"`
+	ThroughBlock           int64  `json:"through_block"`
+	ResumeFromBlock        int64  `json:"resume_from_block"`
+	SnapshotFinalizedBlock int64  `json:"snapshot_finalized_block"`
+}
+
+// AcknowledgePrunedRewardGap is an operator-approved recovery for history that
+// the authoritative local node has already discarded. It never creates reward
+// events: the skipped interval remains explicitly recorded in the durable
+// overview and audit log, while future retained blocks can be scanned normally.
+func (s *Store) AcknowledgePrunedRewardGap(ctx context.Context, expectedCursor, baseline, finalized int64) (RewardGapRebase, error) {
+	result := RewardGapRebase{
+		FromBlock:              expectedCursor + 1,
+		ThroughBlock:           baseline,
+		ResumeFromBlock:        baseline + 1,
+		SnapshotFinalizedBlock: finalized,
+	}
+	if expectedCursor <= 0 || baseline <= expectedCursor || finalized-baseline != RewardGapRetainedWindowBlocks {
+		return RewardGapRebase{}, fmt.Errorf("invalid pruned reward gap rebase %d -> %d at finalized %d", expectedCursor, baseline, finalized)
+	}
+	auditID, err := NewID("aud")
+	if err != nil {
+		return RewardGapRebase{}, err
+	}
+	result.AuditID = auditID
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return RewardGapRebase{}, err
+	}
+	defer tx.Rollback()
+	var current int64
+	var raw []byte
+	if err := tx.QueryRowContext(ctx, `SELECT last_scanned_block,payload FROM reward_monitor_state WHERE id=1 FOR UPDATE`).Scan(&current, &raw); err != nil {
+		return RewardGapRebase{}, err
+	}
+	var overview model.RewardOverview
+	if err := json.Unmarshal(raw, &overview); err != nil {
+		return RewardGapRebase{}, fmt.Errorf("decode reward monitor state: %w", err)
+	}
+	if current != expectedCursor || overview.LastScannedBlock != expectedCursor {
+		return RewardGapRebase{}, fmt.Errorf("%w: column=%d payload=%d expected=%d", ErrRewardCursorConflict, current, overview.LastScannedBlock, expectedCursor)
+	}
+	if overview.Sources == nil {
+		overview.Sources = map[string]string{}
+	}
+	overview.LastScannedBlock = baseline
+	overview.FinalizedBlock = finalized
+	overview.Gap = fmt.Sprintf("acknowledged pruned history blocks %d-%d; retained scan pending from %d", result.FromBlock, result.ThroughBlock, result.ResumeFromBlock)
+	overview.Sources["historical_gap"] = fmt.Sprintf("acknowledged_pruned_blocks_%d_%d", result.FromBlock, result.ThroughBlock)
+	details := map[string]any{
+		"authority":                "local_finalized_rpc",
+		"from_block":               result.FromBlock,
+		"history_recovered":        false,
+		"reason":                   "local_state_pruned",
+		"resume_from_block":        result.ResumeFromBlock,
+		"retained_window_blocks":   RewardGapRetainedWindowBlocks,
+		"snapshot_finalized_block": result.SnapshotFinalizedBlock,
+		"through_block":            result.ThroughBlock,
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_events(id,action,actor,result,details) VALUES($1,'reward.history_gap.acknowledge','operator-approved-controller-recovery','acknowledged',$2)`, auditID, JSON(details)); err != nil {
+		return RewardGapRebase{}, err
+	}
+	update, err := tx.ExecContext(ctx, `UPDATE reward_monitor_state SET last_scanned_block=$1,payload=$2,updated_at=now() WHERE id=1 AND last_scanned_block=$3`, baseline, JSON(overview), expectedCursor)
+	if err != nil {
+		return RewardGapRebase{}, err
+	}
+	affected, err := update.RowsAffected()
+	if err != nil {
+		return RewardGapRebase{}, err
+	}
+	if affected != 1 {
+		return RewardGapRebase{}, fmt.Errorf("%w: rebase update affected %d rows", ErrRewardCursorConflict, affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return RewardGapRebase{}, err
+	}
+	return result, nil
+}
+
+func upsertRewardObservation(ctx context.Context, execer rewardObservationExecer, x model.RewardObservation) error {
 	if x.AuthoredAt.IsZero() {
 		x.AuthoredAt = time.Now().UTC()
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO reward_events(block_number,block_hash,authored_at,expected_planck,credited_planck,wallet_before_planck,wallet_after_planck,pot_before_planck,verification,source_count,evidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(block_number) DO UPDATE SET source_count=GREATEST(reward_events.source_count,excluded.source_count),verification=CASE WHEN excluded.source_count>=reward_events.source_count THEN excluded.verification ELSE reward_events.verification END,evidence=reward_events.evidence||excluded.evidence`, x.BlockNumber, x.BlockHash, x.AuthoredAt, x.ExpectedPlanck, x.CreditedPlanck, x.WalletBeforePlanck, x.WalletAfterPlanck, x.PotBeforePlanck, x.Verification, x.SourceCount, JSON(x.Evidence))
-	return err
+	result, err := execer.ExecContext(ctx, `INSERT INTO reward_events(block_number,block_hash,authored_at,expected_planck,credited_planck,wallet_before_planck,wallet_after_planck,pot_before_planck,verification,source_count,evidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(block_number) DO UPDATE SET source_count=GREATEST(reward_events.source_count,excluded.source_count),verification=CASE WHEN excluded.source_count>=reward_events.source_count THEN excluded.verification ELSE reward_events.verification END,evidence=reward_events.evidence||excluded.evidence WHERE reward_events.block_hash=excluded.block_hash`, x.BlockNumber, x.BlockHash, x.AuthoredAt, x.ExpectedPlanck, x.CreditedPlanck, x.WalletBeforePlanck, x.WalletAfterPlanck, x.PotBeforePlanck, x.Verification, x.SourceCount, JSON(x.Evidence))
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return fmt.Errorf("%w at block %d", ErrRewardBlockHashConflict, x.BlockNumber)
+	}
+	return nil
+}
+
+// ApplyRewardScan commits the observations and their cursor as one unit. The
+// expected cursor check prevents a stale or duplicate controller from moving
+// the monitor state past data it did not observe.
+func (s *Store) ApplyRewardScan(ctx context.Context, expectedCursor int64, overview model.RewardOverview, observations []model.RewardObservation) error {
+	if expectedCursor <= 0 || overview.LastScannedBlock <= expectedCursor {
+		return fmt.Errorf("invalid reward cursor transition %d -> %d", expectedCursor, overview.LastScannedBlock)
+	}
+	if overview.LastScannedBlock-expectedCursor > 16 {
+		return fmt.Errorf("reward cursor transition exceeds 16 blocks: %d -> %d", expectedCursor, overview.LastScannedBlock)
+	}
+	for _, observation := range observations {
+		if observation.BlockNumber <= expectedCursor || observation.BlockNumber > overview.LastScannedBlock {
+			return fmt.Errorf("reward observation block %d is outside cursor transition %d -> %d", observation.BlockNumber, expectedCursor, overview.LastScannedBlock)
+		}
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT last_scanned_block FROM reward_monitor_state WHERE id=1 FOR UPDATE`).Scan(&current); err != nil {
+		return err
+	}
+	if current != expectedCursor {
+		return fmt.Errorf("%w: have %d, expected %d", ErrRewardCursorConflict, current, expectedCursor)
+	}
+	for _, observation := range observations {
+		if err := upsertRewardObservation(ctx, tx, observation); err != nil {
+			return err
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE reward_monitor_state SET last_scanned_block=$1,payload=$2,updated_at=now() WHERE id=1`, overview.LastScannedBlock, JSON(overview))
+	if err != nil {
+		return err
+	}
+	if affected, affectedErr := result.RowsAffected(); affectedErr != nil || affected != 1 {
+		return fmt.Errorf("reward cursor update affected %d rows: %w", affected, affectedErr)
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RewardPage(ctx context.Context, limit int, before int64) ([]model.RewardObservation, error) {

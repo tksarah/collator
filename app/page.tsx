@@ -104,6 +104,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json", ...(csrf ? { "X-CSRF-Token": csrf } : {}), ...(init?.headers || {}) },
   });
   if (response.status === 401) throw new Error("unauthorized");
+  if (response.status === 429) throw new Error("rate_limited");
   if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
   const nextCsrf = response.headers.get("X-CSRF-Token");
   if (nextCsrf) sessionStorage.setItem("sg_csrf", nextCsrf);
@@ -314,7 +315,7 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
     try {
       await api("/auth/login", { method: "POST", body: JSON.stringify({ username: form.get("username"), password: form.get("password"), totp_code: form.get("totp") }) });
       onSuccess();
-    } catch { setError("ユーザー名、パスワード、または認証コードを確認してください。"); }
+    } catch (error) { setError(error instanceof Error && error.message === "rate_limited" ? "試行回数が多すぎます。しばらく待ってから再試行してください。" : "ユーザー名、パスワード、または認証コードを確認してください。"); }
   }
   if (needsBootstrap) return <Bootstrap onDone={() => setNeedsBootstrap(false)} />;
   return <main className="login-page"><section className="login-panel"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">SECURE OPERATOR ACCESS</p><h1>ノード運用へログイン</h1><p className="muted">管理操作はすべて記録され、再起動には再認証が必要です。</p><form onSubmit={submit}><label>ユーザー名<input name="username" autoComplete="username" required /></label><label>パスワード<input type="password" name="password" autoComplete="current-password" required /></label><label>認証コードまたはrecovery code<input name="totp" autoComplete="one-time-code" required /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button" type="submit">ログイン</button></form></section></main>;

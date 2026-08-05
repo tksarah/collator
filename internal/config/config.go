@@ -18,6 +18,8 @@ type Config struct {
 	EncryptionKey       string
 	AgentObserveSock    string
 	AgentControlSock    string
+	ActionBrokerSock    string
+	ActionBrokerKey     string
 	NodeName            string
 	SystemdUnit         string
 	GeminiAPIKey        string
@@ -42,13 +44,15 @@ type Config struct {
 func Load() (Config, error) {
 	installedAt, _ := time.Parse(time.RFC3339, getenv("INSTALLED_AT", time.Now().UTC().Format(time.RFC3339)))
 	cfg := Config{
-		DatabaseURL:         secret("DATABASE_URL", "postgres://guardian:guardian@postgres:5432/guardian?sslmode=disable"),
+		DatabaseURL:         secret("DATABASE_URL", ""),
 		ListenAddress:       getenv("LISTEN_ADDRESS", ":8080"),
 		CookieSecure:        getenv("COOKIE_SECURE", "true") == "true",
 		BootstrapToken:      secret("BOOTSTRAP_TOKEN", ""),
 		EncryptionKey:       secret("ENCRYPTION_KEY", ""),
 		AgentObserveSock:    getenv("AGENT_OBSERVE_SOCKET", "/run/shiden-guardian/observe/agent.sock"),
 		AgentControlSock:    getenv("AGENT_CONTROL_SOCKET", "/run/shiden-guardian/control/agent.sock"),
+		ActionBrokerSock:    getenv("ACTION_BROKER_SOCKET", "/run/shiden-guardian/action-broker/controller.sock"),
+		ActionBrokerKey:     secret("ACTION_BROKER_KEY", ""),
 		NodeName:            getenv("NODE_NAME", "tk_sdn_collator"),
 		SystemdUnit:         getenv("SYSTEMD_UNIT", "astar.service"),
 		GeminiAPIKey:        secret("GEMINI_API_KEY", ""),

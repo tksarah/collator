@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/shiden-guardian/shiden-guardian/internal/agentclient"
@@ -26,44 +24,17 @@ import (
 )
 
 type user struct {
-	ID, Username, PasswordHash, TOTPSecret string
-	Recovery                               []string
+	ID, Username string
 }
 type contextKey string
 
 const userKey contextKey = "user"
 
 type server struct {
-	cfg     config.Config
-	store   *store.Store
-	agent   *agentclient.Client
-	limiter *loginLimiter
+	cfg   config.Config
+	store *store.Store
+	agent *agentclient.Client
 }
-type loginLimiter struct {
-	mu      sync.Mutex
-	entries map[string][]time.Time
-}
-
-func newLimiter() *loginLimiter { return &loginLimiter{entries: map[string][]time.Time{}} }
-func (l *loginLimiter) allow(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	cut := time.Now().Add(-15 * time.Minute)
-	items := l.entries[key][:0]
-	for _, t := range l.entries[key] {
-		if t.After(cut) {
-			items = append(items, t)
-		}
-	}
-	l.entries[key] = items
-	return len(items) < 5
-}
-func (l *loginLimiter) fail(key string) {
-	l.mu.Lock()
-	l.entries[key] = append(l.entries[key], time.Now())
-	l.mu.Unlock()
-}
-func (l *loginLimiter) clear(key string) { l.mu.Lock(); delete(l.entries, key); l.mu.Unlock() }
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
@@ -79,20 +50,6 @@ func main() {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
-	if len(os.Args) > 1 && os.Args[1] == "-migrate-dry-run" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := store.DryRunMigrations(ctx, cfg.DatabaseURL); err != nil {
-			slog.Error("migration dry-run", "error", err)
-			os.Exit(1)
-		}
-		slog.Info("migration dry-run succeeded")
-		return
-	}
-	if cfg.EncryptionKey == "" {
-		slog.Error("config", "error", "ENCRYPTION_KEY is required")
-		os.Exit(1)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	db, err := store.Open(ctx, cfg.DatabaseURL)
@@ -101,14 +58,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.DB.Close()
-	s := &server{cfg: cfg, store: db, agent: agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), limiter: newLimiter()}
+	s := &server{cfg: cfg, store: db, agent: agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /api/v1/auth/bootstrap/status", s.bootstrapStatus)
-	mux.HandleFunc("POST /api/v1/auth/bootstrap/start", s.bootstrapStart)
-	mux.HandleFunc("POST /api/v1/auth/bootstrap/confirm", s.bootstrapConfirm)
-	mux.HandleFunc("POST /api/v1/auth/login", s.login)
-	mux.Handle("POST /api/v1/auth/logout", s.requireAuth(http.HandlerFunc(s.logout)))
 	mux.Handle("GET /api/v1/overview", s.requireAuth(http.HandlerFunc(s.overview)))
 	mux.Handle("GET /api/v1/metrics/{panel}", s.requireAuth(http.HandlerFunc(s.metrics)))
 	mux.Handle("GET /api/v1/logs", s.requireAuth(http.HandlerFunc(s.logs)))
@@ -116,9 +68,7 @@ func main() {
 	mux.Handle("GET /api/v1/rewards", s.requireAuth(http.HandlerFunc(s.rewards)))
 	mux.Handle("POST /api/v1/diagnoses", s.requireAuth(http.HandlerFunc(s.diagnose)))
 	mux.Handle("GET /api/v1/diagnoses", s.requireAuth(http.HandlerFunc(s.diagnoses)))
-	mux.Handle("POST /api/v1/actions/restart", s.requireAuth(http.HandlerFunc(s.restart)))
 	mux.Handle("GET /api/v1/settings", s.requireAuth(http.HandlerFunc(s.settings)))
-	mux.Handle("PUT /api/v1/settings", s.requireAuth(http.HandlerFunc(s.updateSettings)))
 	mux.Handle("POST /api/v1/settings/test-smtp", s.requireAuth(http.HandlerFunc(s.testSMTP)))
 	mux.Handle("POST /api/v1/settings/test-gemini", s.requireAuth(http.HandlerFunc(s.testGemini)))
 	mux.Handle("GET /api/v1/audit", s.requireAuth(http.HandlerFunc(s.audit)))
@@ -157,178 +107,6 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
-func (s *server) bootstrapStatus(w http.ResponseWriter, r *http.Request) {
-	var count int
-	_ = s.store.DB.QueryRowContext(r.Context(), `SELECT count(*) FROM users WHERE active=true`).Scan(&count)
-	writeJSON(w, 200, map[string]any{"needs_bootstrap": count == 0})
-}
-func (s *server) checkBootstrap(value string) bool {
-	return s.cfg.BootstrapToken != "" && subtle.ConstantTimeCompare([]byte(value), []byte(s.cfg.BootstrapToken)) == 1
-}
-func (s *server) bootstrapStart(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Token    string `json:"token"`
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	if !s.checkBootstrap(body.Token) {
-		writeJSON(w, 403, map[string]string{"error": "invalid_bootstrap_token"})
-		return
-	}
-	var active int
-	_ = s.store.DB.QueryRowContext(r.Context(), `SELECT count(*) FROM users WHERE active=true`).Scan(&active)
-	if active > 0 {
-		writeJSON(w, 409, map[string]string{"error": "already_bootstrapped"})
-		return
-	}
-	if !auth.ValidUsername(body.Username) || !auth.ValidPassword(body.Password) {
-		writeJSON(w, 400, map[string]string{"error": "username_or_password_policy"})
-		return
-	}
-	passwordHash, err := auth.HashPassword(body.Password)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "internal"})
-		return
-	}
-	secret, err := auth.GenerateTOTPSecret()
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "internal"})
-		return
-	}
-	encryptedSecret, err := auth.EncryptSecret(s.cfg.EncryptionKey, secret)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "encryption"})
-		return
-	}
-	plain, hashes, err := auth.RecoveryCodes(8)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "internal"})
-		return
-	}
-	tx, err := s.store.DB.BeginTx(r.Context(), nil)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	defer tx.Rollback()
-	_, _ = tx.ExecContext(r.Context(), `DELETE FROM users WHERE active=false`)
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO users(id,username,password_hash,totp_secret,recovery_hashes,active) VALUES($1,$2,$3,$4,$5,false)`, store.ID("usr"), body.Username, passwordHash, encryptedSecret, store.JSON(hashes))
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	if err = tx.Commit(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	s.store.Audit(r.Context(), "admin.bootstrap.start", body.Username, "success", map[string]any{})
-	writeJSON(w, 201, map[string]any{"secret": secret, "otpauth_uri": auth.TOTPURI(secret, body.Username), "recovery_codes": plain})
-}
-func (s *server) bootstrapConfirm(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Token    string `json:"token"`
-		Username string `json:"username"`
-		TOTP     string `json:"totp_code"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	if !s.checkBootstrap(body.Token) {
-		writeJSON(w, 403, map[string]string{"error": "invalid_bootstrap_token"})
-		return
-	}
-	var encryptedSecret string
-	err := s.store.DB.QueryRowContext(r.Context(), `SELECT totp_secret FROM users WHERE username=$1 AND active=false`, body.Username).Scan(&encryptedSecret)
-	secret, decryptErr := auth.DecryptSecret(s.cfg.EncryptionKey, encryptedSecret)
-	if err != nil || decryptErr != nil || !auth.ValidateTOTP(secret, body.TOTP, time.Now()) {
-		writeJSON(w, 400, map[string]string{"error": "invalid_totp"})
-		return
-	}
-	_, err = s.store.DB.ExecContext(r.Context(), `UPDATE users SET active=true WHERE username=$1 AND active=false`, body.Username)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	s.store.Audit(r.Context(), "admin.bootstrap.confirm", body.Username, "success", map[string]any{})
-	writeJSON(w, 200, map[string]string{"status": "active"})
-}
-
-func (s *server) decryptUser(x *user) error {
-	secret, err := auth.DecryptSecret(s.cfg.EncryptionKey, x.TOTPSecret)
-	if err != nil {
-		return err
-	}
-	x.TOTPSecret = secret
-	return nil
-}
-func (s *server) loadUser(ctx context.Context, username string) (user, error) {
-	var x user
-	var raw []byte
-	err := s.store.DB.QueryRowContext(ctx, `SELECT id,username,password_hash,totp_secret,recovery_hashes FROM users WHERE username=$1 AND active=true`, username).Scan(&x.ID, &x.Username, &x.PasswordHash, &x.TOTPSecret, &raw)
-	if err == nil {
-		err = json.Unmarshal(raw, &x.Recovery)
-	}
-	if err == nil {
-		err = s.decryptUser(&x)
-	}
-	return x, err
-}
-func (s *server) login(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		TOTP     string `json:"totp_code"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	key := strings.ToLower(body.Username) + "|" + ip
-	if !s.limiter.allow(key) {
-		writeJSON(w, 429, map[string]string{"error": "too_many_attempts"})
-		return
-	}
-	x, err := s.loadUser(r.Context(), body.Username)
-	ok := err == nil && auth.VerifyPassword(x.PasswordHash, body.Password)
-	recoveryIndex := -1
-	if ok && !auth.ValidateTOTP(x.TOTPSecret, body.TOTP, time.Now()) {
-		hash := auth.HashToken(strings.ToUpper(strings.TrimSpace(body.TOTP)))
-		for i, item := range x.Recovery {
-			if subtle.ConstantTimeCompare([]byte(hash), []byte(item)) == 1 {
-				recoveryIndex = i
-				break
-			}
-		}
-		ok = recoveryIndex >= 0
-	}
-	if !ok {
-		s.limiter.fail(key)
-		s.store.Audit(r.Context(), "session.login", body.Username, "denied", map[string]any{"ip": ip})
-		time.Sleep(250 * time.Millisecond)
-		writeJSON(w, 401, map[string]string{"error": "invalid_credentials"})
-		return
-	}
-	if recoveryIndex >= 0 {
-		x.Recovery = append(x.Recovery[:recoveryIndex], x.Recovery[recoveryIndex+1:]...)
-		_, _ = s.store.DB.ExecContext(r.Context(), `UPDATE users SET recovery_hashes=$2 WHERE id=$1`, x.ID, store.JSON(x.Recovery))
-	}
-	sessionToken, _ := auth.RandomToken(32)
-	csrf, _ := auth.RandomToken(24)
-	_, err = s.store.DB.ExecContext(r.Context(), `INSERT INTO sessions(token_hash,user_id,csrf_hash,expires_at) VALUES($1,$2,$3,$4)`, auth.HashToken(sessionToken), x.ID, auth.HashToken(csrf), time.Now().Add(12*time.Hour))
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	http.SetCookie(w, &http.Cookie{Name: "sg_session", Value: sessionToken, Path: "/", MaxAge: 43200, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
-	w.Header().Set("X-CSRF-Token", csrf)
-	s.limiter.clear(key)
-	s.store.Audit(r.Context(), "session.login", x.Username, "success", map[string]any{"ip": ip})
-	writeJSON(w, 200, map[string]any{"username": x.Username})
-}
-
 func (s *server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("sg_session")
@@ -337,16 +115,9 @@ func (s *server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		var x user
-		var recoveryRaw []byte
 		var csrfHash string
 		var expires time.Time
-		err = s.store.DB.QueryRowContext(r.Context(), `SELECT u.id,u.username,u.password_hash,u.totp_secret,u.recovery_hashes,s.csrf_hash,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND u.active=true`, auth.HashToken(cookie.Value)).Scan(&x.ID, &x.Username, &x.PasswordHash, &x.TOTPSecret, &recoveryRaw, &csrfHash, &expires)
-		if err == nil {
-			err = json.Unmarshal(recoveryRaw, &x.Recovery)
-		}
-		if err == nil {
-			err = s.decryptUser(&x)
-		}
+		err = s.store.DB.QueryRowContext(r.Context(), `SELECT u.id,u.username,s.csrf_hash,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND u.active=true`, auth.HashToken(cookie.Value)).Scan(&x.ID, &x.Username, &csrfHash, &expires)
 		if err != nil || expires.Before(time.Now()) {
 			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
 			return
@@ -362,15 +133,6 @@ func (s *server) requireAuth(next http.Handler) http.Handler {
 	})
 }
 func currentUser(r *http.Request) user { return r.Context().Value(userKey).(user) }
-func (s *server) logout(w http.ResponseWriter, r *http.Request) {
-	cookie, _ := r.Cookie("sg_session")
-	if cookie != nil {
-		_, _ = s.store.DB.ExecContext(r.Context(), `DELETE FROM sessions WHERE token_hash=$1`, auth.HashToken(cookie.Value))
-	}
-	http.SetCookie(w, &http.Cookie{Name: "sg_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
-	s.store.Audit(r.Context(), "session.logout", currentUser(r).Username, "success", map[string]any{})
-	writeJSON(w, 200, map[string]string{"status": "ok"})
-}
 
 func (s *server) overview(w http.ResponseWriter, r *http.Request) {
 	value, err := s.store.LoadOverview(r.Context())
@@ -533,65 +295,9 @@ func (s *server) testSMTP(w http.ResponseWriter, r *http.Request) { s.enqueueTes
 func (s *server) testGemini(w http.ResponseWriter, r *http.Request) {
 	s.enqueueTest(w, r, "test_gemini")
 }
-func (s *server) restart(w http.ResponseWriter, r *http.Request) {
-	x := currentUser(r)
-	var body struct {
-		Password   string `json:"password"`
-		TOTP       string `json:"totp_code"`
-		Reason     string `json:"reason"`
-		Confirm    string `json:"confirm"`
-		IncidentID string `json:"incident_id"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	if body.Confirm != s.cfg.NodeName || len(strings.TrimSpace(body.Reason)) < 10 || !auth.VerifyPassword(x.PasswordHash, body.Password) || !auth.ValidateTOTP(x.TOTPSecret, body.TOTP, time.Now()) {
-		s.store.Audit(r.Context(), "restart.request", x.Username, "denied", map[string]any{})
-		writeJSON(w, 403, map[string]string{"error": "step_up_failed"})
-		return
-	}
-	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	if key == "" || len(key) > 100 {
-		writeJSON(w, 400, map[string]string{"error": "idempotency_key_required"})
-		return
-	}
-	id := store.ID("act")
-	err := s.store.DB.QueryRowContext(r.Context(), `INSERT INTO remediation_actions(id,idempotency_key,incident_id,requested_by,reason,mode,status) VALUES($1,$2,NULLIF($3,''),$4,$5,'manual','pending') ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=excluded.idempotency_key RETURNING id`, id, key, body.IncidentID, x.Username, strings.TrimSpace(body.Reason)).Scan(&id)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	s.store.Audit(r.Context(), "restart.request", x.Username, "queued", map[string]string{"action_id": id})
-	writeJSON(w, 202, map[string]string{"id": id, "status": "pending"})
-}
 func (s *server) settings(w http.ResponseWriter, r *http.Request) {
 	enabled := s.store.SettingBool(r.Context(), "automation_enabled", false)
 	writeJSON(w, 200, map[string]any{"automation_enabled": enabled, "observe_until": s.cfg.InstalledAt.Add(s.cfg.ObserveOnlyPeriod), "node_name": s.cfg.NodeName, "systemd_unit": s.cfg.SystemdUnit})
-}
-func (s *server) updateSettings(w http.ResponseWriter, r *http.Request) {
-	x := currentUser(r)
-	var body struct {
-		AutomationEnabled bool   `json:"automation_enabled"`
-		Password          string `json:"password"`
-		TOTP              string `json:"totp_code"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	if !auth.VerifyPassword(x.PasswordHash, body.Password) || !auth.ValidateTOTP(x.TOTPSecret, body.TOTP, time.Now()) {
-		writeJSON(w, 403, map[string]string{"error": "step_up_failed"})
-		return
-	}
-	if body.AutomationEnabled && time.Now().Before(s.cfg.InstalledAt.Add(s.cfg.ObserveOnlyPeriod)) {
-		writeJSON(w, 409, map[string]string{"error": "observe_period_not_finished"})
-		return
-	}
-	if err := s.store.SetSetting(r.Context(), "automation_enabled", body.AutomationEnabled); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "database"})
-		return
-	}
-	s.store.Audit(r.Context(), "settings.automation", x.Username, "success", map[string]bool{"enabled": body.AutomationEnabled})
-	writeJSON(w, 200, map[string]bool{"automation_enabled": body.AutomationEnabled})
 }
 func (s *server) audit(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))

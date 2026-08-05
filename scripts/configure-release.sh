@@ -41,14 +41,24 @@ printf 'Notification recipient: '; read -r smtp_to
 printf 'Gemini API key: '; stty -echo; read -r gemini_key; stty echo; printf '\n'
 
 postgres_password="$(openssl rand -hex 24)"
+api_password="$(openssl rand -hex 24)"
+auth_password="$(openssl rand -hex 24)"
+controller_password="$(openssl rand -hex 24)"
+backup_password="$(openssl rand -hex 24)"
 bootstrap_token="$(openssl rand -hex 24)"
 encryption_key="$(openssl rand -base64 32 | tr -d '\n')"
+action_broker_key="$(openssl rand -base64 32 | tr -d '\n')"
 printf '%s' "$postgres_password" > secrets/postgres_password
-printf 'postgres://guardian:%s@postgres:5432/guardian?sslmode=disable' "$postgres_password" > secrets/database_url
+printf 'postgres://guardian:%s@postgres:5432/guardian?sslmode=disable' "$postgres_password" > secrets/migration_database_url
+printf 'postgres://guardian_api:%s@postgres:5432/guardian?sslmode=disable' "$api_password" > secrets/api_database_url
+printf 'postgres://guardian_auth:%s@postgres:5432/guardian?sslmode=disable' "$auth_password" > secrets/auth_database_url
+printf 'postgres://guardian_controller:%s@postgres:5432/guardian?sslmode=disable' "$controller_password" > secrets/controller_database_url
+printf '%s' "$backup_password" > secrets/backup_password
 printf '%s' "$gemini_key" > secrets/gemini_api_key
 printf '%s' "$smtp_password" > secrets/smtp_password
 printf '%s' "$bootstrap_token" > secrets/bootstrap_token
 printf '%s' "$encryption_key" > secrets/encryption_key
+printf '%s' "$action_broker_key" > secrets/action_broker_key
 
 observe_gid="$(getent group shiden-guardian-observe | cut -d: -f3)"
 control_gid="$(getent group shiden-guardian-control | cut -d: -f3)"

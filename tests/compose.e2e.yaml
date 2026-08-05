@@ -36,6 +36,7 @@ services:
     volumes: !override
       - agent_observe:/run/shiden-guardian/observe:ro
       - agent_control:/run/shiden-guardian/control:ro
+      - action_broker_socket:/run/shiden-guardian/action-broker
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,6 +51,30 @@ services:
     volumes: !override
       - ./work/e2e/backups:/backups
       - ./deploy/backup.sh:/opt/backup/backup.sh:ro
+
+  action-probe:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+      target: action-probe
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    network_mode: none
+    environment:
+      ACTION_BROKER_SOCKET: /run/shiden-guardian/action-broker/controller.sock
+    volumes:
+      - action_broker_socket:/run/shiden-guardian/action-broker:ro
+
+  database-probe:
+    profiles: ["tools"]
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["psql"]
+    networks: [backend]
 
 volumes:
   agent_observe:
