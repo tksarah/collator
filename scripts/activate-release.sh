@@ -110,7 +110,12 @@ docker compose --profile tools run --rm dbmigrate -mode=verify
 docker compose --profile tools run --rm dbmigrate -mode=rotate-admin
 credentials_rotated=1
 
-if ! docker compose up -d --remove-orphans --wait --wait-timeout 180; then
+# Runtime database passwords now match only this release. Recreate every
+# non-database service so unchanged images cannot retain bind-mounted secrets
+# from the previous release directory. PostgreSQL keeps its existing container
+# and persistent volume; its password file is only used during initialization.
+if ! docker compose up -d --no-deps --force-recreate --wait --wait-timeout 180 \
+  api controller auth-broker backup prometheus caddy; then
   docker compose logs --tail=120 api controller prometheus caddy
   exit 1
 fi

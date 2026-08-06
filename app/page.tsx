@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { I18nProvider, LanguageToggle, LocalizedMessage, MessageKey, MessageValues, useI18n } from "./i18n";
 
 type Tab = "overview" | "metrics" | "rewards" | "logs" | "incidents" | "maintenance" | "settings";
 type RewardOverview = {
@@ -22,7 +23,15 @@ type Overview = {
   incidents: Incident[];
   updated_at: string;
 };
-type Incident = { id: string; severity: string; title: string; status: string; opened_at: string; diagnosis?: string };
+type PublicNodeStatus = {
+  network: "shiden";
+  overall: "operational" | "degraded" | "unavailable";
+  node: "online" | "offline" | "unknown";
+  sync: "synced" | "catching_up" | "unknown";
+  finalized_block: number | null;
+  observed_at: string | null;
+};
+type Incident = { id: string; fingerprint?: string; severity: string; title: string; status: string; opened_at: string; diagnosis?: string; evidence?: Record<string, unknown> };
 type LogLine = { cursor: string; timestamp: string; priority: string; message: string };
 type Audit = {
   id: string;
@@ -36,18 +45,18 @@ type TimePoint = { timestamp: number; value: number };
 type PrometheusSeries = { metric?: Record<string, string>; values?: [number, string][] };
 type PrometheusResponse = { data?: { result?: PrometheusSeries[] } };
 type LoadedSeries = { id: string; label: string; metric: Record<string, string>; points: TimePoint[] };
-type PanelState = { series: LoadedSeries[]; loading: boolean; error: string };
+type PanelState = { series: LoadedSeries[]; loading: boolean; error?: MessageKey };
 type ChartSeries = LoadedSeries & { color: string; curve?: "linear" | "step"; fill?: boolean };
 type ChartThreshold = { value: number; label: string; color: string; band?: "above" | "below" };
 
-const tabs: { id: Tab; label: string; mark: string }[] = [
-  { id: "overview", label: "概要", mark: "01" },
-  { id: "metrics", label: "メトリクス", mark: "02" },
-  { id: "rewards", label: "報酬", mark: "03" },
-  { id: "logs", label: "ログ", mark: "04" },
-  { id: "incidents", label: "インシデント", mark: "05" },
-  { id: "maintenance", label: "メンテナンス", mark: "06" },
-  { id: "settings", label: "設定・監査", mark: "07" },
+const tabs: { id: Tab; labelKey: MessageKey; mark: string }[] = [
+  { id: "overview", labelKey: "tabs.overview", mark: "01" },
+  { id: "metrics", labelKey: "tabs.metrics", mark: "02" },
+  { id: "rewards", labelKey: "tabs.rewards", mark: "03" },
+  { id: "logs", labelKey: "tabs.logs", mark: "04" },
+  { id: "incidents", labelKey: "tabs.incidents", mark: "05" },
+  { id: "maintenance", labelKey: "tabs.maintenance", mark: "06" },
+  { id: "settings", labelKey: "tabs.settings", mark: "07" },
 ];
 
 const demoOverview: Overview = {
@@ -57,7 +66,7 @@ const demoOverview: Overview = {
   automation: { mode: "observe_only", enabled: false, host_locked: false, eligible_at: "2026-08-18T12:00:00Z" },
   rewards: { address: "WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN", status: "healthy", monitoring_started_at: "2026-08-05T00:00:00Z", active_session: true, validator_count: 12, finalized_block: 9_842_716, last_scanned_block: 9_842_716, last_authored_block: 9_842_704, last_reward_at: new Date(Date.now()-72_000).toISOString(), seconds_since_reward: 72, blocks_since_authored: 12, kick_blocks_remaining: 1188, wallet_free_planck: "6278626775264166000000", last_reward_planck: "241000000000000000", reward_24h_planck: "289200000000000000000", reward_24h_count: 1200, reward_total_planck: "867600000000000000000", reward_total_count: 3600, spec_version: 2300, schema_ok: true, quorum: 3, sources: { local: "ok", external_1: "ok", external_2: "ok" } },
   incidents: [
-    { id: "demo-1", severity: "warning", title: "Relay peer数が一時的に低下", status: "resolved", opened_at: "2026-08-03T03:41:00Z", diagnosis: "90秒以内に自然回復しました。操作は行っていません。" },
+    { id: "demo-1", fingerprint: "peers-low", severity: "warning", title: "Relay peer数が一時的に低下", status: "resolved", opened_at: "2026-08-03T03:41:00Z", diagnosis: "90秒以内に自然回復しました。操作は行っていません。", evidence: { peers: 2 } },
   ],
   updated_at: new Date().toISOString(),
 };
@@ -66,34 +75,15 @@ const chartValues = [34, 38, 36, 44, 41, 52, 48, 45, 57, 54, 61, 58, 64, 59, 62,
 const rangeSeconds: Record<string, number> = { "30m": 1800, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000 };
 const demoModeEnabled = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
 
-function fmtNumber(value: number) {
-  return new Intl.NumberFormat("ja-JP").format(value);
+type MessageState = LocalizedMessage | string | null;
+
+function message(key: MessageKey, values?: MessageValues): LocalizedMessage {
+  return { key, values };
 }
 
-function fmtTime(value: string) {
-  return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value));
-}
-
-function fmtUptime(seconds: number) {
-  const days = Math.floor(seconds / 86400);
-  const hours = Math.floor((seconds % 86400) / 3600);
-  return `${days}日 ${hours}時間`;
-}
-
-function fmtPlanck(value?: string, digits = 6) {
-  try {
-    const raw = BigInt(value || "0");
-    const base = BigInt(10) ** BigInt(18);
-    const whole = raw / base;
-    const fraction = (raw % base).toString().padStart(18, "0").slice(0, digits).replace(/0+$/, "");
-    return `${new Intl.NumberFormat("ja-JP").format(whole)}${fraction ? `.${fraction}` : ""} SDN`;
-  } catch { return "—"; }
-}
-
-function fmtDuration(seconds: number) {
-  if (seconds < 60) return `${seconds}秒`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}分`;
-  return `${Math.floor(seconds / 3600)}時間 ${Math.floor((seconds % 3600) / 60)}分`;
+function localized(messageState: MessageState, t: (key: MessageKey, values?: MessageValues) => string) {
+  if (!messageState) return "";
+  return typeof messageState === "string" ? messageState : t(messageState.key, messageState.values);
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -109,6 +99,31 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const nextCsrf = response.headers.get("X-CSRF-Token");
   if (nextCsrf) sessionStorage.setItem("sg_csrf", nextCsrf);
   return response.json() as Promise<T>;
+}
+
+function isPublicNodeStatus(value: unknown): value is PublicNodeStatus {
+  if (!value || typeof value !== "object") return false;
+  const status = value as Partial<PublicNodeStatus>;
+  const finalized = status.finalized_block;
+  return status.network === "shiden"
+    && ["operational", "degraded", "unavailable"].includes(String(status.overall))
+    && ["online", "offline", "unknown"].includes(String(status.node))
+    && ["synced", "catching_up", "unknown"].includes(String(status.sync))
+    && (finalized === null || (typeof finalized === "number" && Number.isSafeInteger(finalized) && finalized >= 0))
+    && (status.observed_at === null || (typeof status.observed_at === "string" && Number.isFinite(Date.parse(status.observed_at))));
+}
+
+async function publicStatusApi(signal: AbortSignal): Promise<PublicNodeStatus> {
+  const response = await fetch("/api/v1/public/status", {
+    method: "GET",
+    credentials: "omit",
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  if (!response.ok) throw new Error("public_status_unavailable");
+  const value: unknown = await response.json();
+  if (!isPublicNodeStatus(value)) throw new Error("public_status_invalid");
+  return value;
 }
 
 function normalizePoints(values: [number, string][] = []): TimePoint[] {
@@ -138,7 +153,7 @@ function parsePrometheus(response: PrometheusResponse): LoadedSeries[] {
 }
 
 function usePrometheusPanel(panel: string, range: string, demo: boolean, demoSeries: LoadedSeries[]): PanelState {
-  const [state, setState] = useState<PanelState>({ series: [], loading: true, error: "" });
+  const [state, setState] = useState<PanelState>({ series: [], loading: true });
   useEffect(() => {
     if (demo) return;
 
@@ -149,10 +164,10 @@ function usePrometheusPanel(panel: string, range: string, demo: boolean, demoSer
       current = new AbortController();
       try {
         const response = await api<PrometheusResponse>(`/metrics/${panel}?range=${range}`, { signal: current.signal });
-        if (!stopped) setState({ series: parsePrometheus(response), loading: false, error: "" });
+        if (!stopped) setState({ series: parsePrometheus(response), loading: false });
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
-        if (!stopped) setState((previous) => ({ ...previous, loading: false, error: "履歴データを取得できませんでした。15秒後に再試行します。" }));
+        if (!stopped) setState((previous) => ({ ...previous, loading: false, error: "chart.historyError" }));
       }
     }
 
@@ -163,8 +178,8 @@ function usePrometheusPanel(panel: string, range: string, demo: boolean, demoSer
       current?.abort();
       window.clearInterval(timer);
     };
-  }, [panel, range, demo, demoSeries]);
-  return demo ? { series: demoSeries, loading: false, error: "" } : state;
+  }, [panel, range, demo]);
+  return demo ? { series: demoSeries, loading: false } : state;
 }
 
 function seriesValues(series: LoadedSeries[] | ChartSeries[]) {
@@ -185,7 +200,12 @@ function latestValue(series: LoadedSeries[]) {
   return series[0]?.points.at(-1)?.value;
 }
 
-export default function Dashboard() {
+export default function Page() {
+  return <I18nProvider><Dashboard /></I18nProvider>;
+}
+
+function Dashboard() {
+  const { t, formatDateTime } = useI18n();
   const [tab, setTab] = useState<Tab>("overview");
   const [overview, setOverview] = useState<Overview>(demoOverview);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
@@ -195,7 +215,7 @@ export default function Dashboard() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [restartOpen, setRestartOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState<MessageState>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -251,7 +271,10 @@ export default function Dashboard() {
     };
   }, [tab, demo, refreshAudits]);
 
-  if (authenticated === null) return <main className="login-shell"><section className="login-card"><div className="brand-orbit large"><span /></div><p>Shiden Guardianへ安全に接続しています…</p></section></main>;
+  const activeTab = tabs.find((item) => item.id === tab);
+  const activeTabLabel = activeTab ? t(activeTab.labelKey) : "";
+
+  if (authenticated === null) return <main className="login-shell"><section className="login-card"><div className="brand-orbit large"><span /></div><p>{t("loading.connecting")}</p></section></main>;
   if (authenticated === false) return <Login onSuccess={refresh} />;
 
   return (
@@ -262,88 +285,155 @@ export default function Dashboard() {
           <div><strong>SHIDEN</strong><small>GUARDIAN</small></div>
         </div>
         <div className="network-badge"><span className="pulse-dot" />KUSAMA · SHIDEN</div>
-        <nav aria-label="メインナビゲーション">
+        <nav aria-label={t("nav.main")}>
           {tabs.map((item) => (
             <button key={item.id} className={tab === item.id ? "nav-item active" : "nav-item"} onClick={() => { setTab(item.id); setMenuOpen(false); }}>
-              <span className="nav-mark">{item.mark}</span><span>{item.label}</span>
+              <span className="nav-mark">{item.mark}</span><span>{t(item.labelKey)}</span>
             </button>
           ))}
         </nav>
         <div className="sidebar-foot">
           <p>NODE</p><strong>{overview.node.name}</strong>
-          <a href="https://telemetry.polkadot.io/#list/0xf1cf9022c7ebb34b162d5b5e34e705a5a740b2d0ecc1009fb89023e62a488108" target="_blank" rel="noreferrer">Telemetryを開く ↗</a>
+          <a href="https://telemetry.polkadot.io/#list/0xf1cf9022c7ebb34b162d5b5e34e705a5a740b2d0ecc1009fb89023e62a488108" target="_blank" rel="noreferrer">{t("nav.openTelemetry")}</a>
         </div>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
-          <button className="menu-button" aria-label="メニュー" onClick={() => setMenuOpen((v) => !v)}>☰</button>
+          <button className="menu-button" aria-label={t("topbar.menu")} onClick={() => setMenuOpen((v) => !v)}>☰</button>
           <div>
-            <span className="eyebrow">OPERATIONS / {tabs.find((x) => x.id === tab)?.label}</span>
-            <h1>{tabs.find((x) => x.id === tab)?.label}</h1>
+            <span className="eyebrow">OPERATIONS / {activeTabLabel}</span>
+            <h1>{activeTabLabel}</h1>
           </div>
           <div className="topbar-actions">
-            {demo && <span className="demo-label">プレビュー</span>}
-            <span className="last-update">更新 {fmtTime(overview.updated_at)}</span>
-            <button className="refresh-button" onClick={refresh} aria-label="更新">↻</button>
-            <button className="small-button" onClick={async () => { try { await api("/auth/logout", { method: "POST", body: "{}" }); } finally { sessionStorage.removeItem("sg_csrf"); setAuthenticated(false); } }}>ログアウト</button>
+            {demo && <span className="demo-label">{t("topbar.preview")}</span>}
+            <span className="last-update">{t("topbar.updated", { time: formatDateTime(overview.updated_at) })}</span>
+            <LanguageToggle />
+            <button className="refresh-button" onClick={refresh} aria-label={t("topbar.refresh")}>↻</button>
+            <button className="small-button" onClick={async () => { try { await api("/auth/logout", { method: "POST", body: "{}" }); } finally { sessionStorage.removeItem("sg_csrf"); setAuthenticated(false); } }}>{t("topbar.logout")}</button>
           </div>
         </header>
 
-        {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")}>×</button></div>}
+        {notice && <div className="notice" role="status">{localized(notice, t)}<button aria-label={t("common.close")} onClick={() => setNotice(null)}>×</button></div>}
         {tab === "overview" && <OverviewTab data={overview} demo={demo} onRestart={() => setRestartOpen(true)} />}
         {tab === "metrics" && <MetricsTab data={overview} demo={demo} />}
         {tab === "rewards" && <RewardsTab overview={overview.rewards} demo={demo} />}
         {tab === "logs" && <LogsTab lines={logs} demo={demo} />}
-        {tab === "incidents" && <IncidentsTab incidents={overview.incidents} demo={demo} onDiagnose={async () => { if (!demo) await api("/diagnoses", { method: "POST", body: "{}" }); setNotice("AI診断をキューへ登録しました。完了時に監査履歴へ記録します。" ); }} />}
+        {tab === "incidents" && <IncidentsTab incidents={overview.incidents} demo={demo} onDiagnose={async () => { if (!demo) await api("/diagnoses", { method: "POST", body: "{}" }); setNotice(message("notice.diagnosisQueued")); }} />}
         {tab === "maintenance" && <MaintenanceTab data={overview} onRestart={() => setRestartOpen(true)} />}
         {tab === "settings" && <SettingsTab data={overview} audits={audits} demo={demo} setNotice={setNotice} onAuditRefresh={refreshAudits} onAutomation={() => setAutomationOpen(true)} />}
       </section>
-      {restartOpen && <RestartDialog demo={demo} onClose={() => setRestartOpen(false)} onDone={(message) => { setRestartOpen(false); setNotice(message); }} />}
-      {automationOpen && <AutomationDialog enabled={overview.automation.enabled} onClose={() => setAutomationOpen(false)} onDone={(message) => { setAutomationOpen(false); setNotice(message); refresh(); }} />}
+      {restartOpen && <RestartDialog demo={demo} onClose={() => setRestartOpen(false)} onDone={(nextMessage) => { setRestartOpen(false); setNotice(nextMessage); }} />}
+      {automationOpen && <AutomationDialog enabled={overview.automation.enabled} onClose={() => setAutomationOpen(false)} onDone={(nextMessage) => { setAutomationOpen(false); setNotice(nextMessage); refresh(); }} />}
     </main>
   );
 }
 
 function Login({ onSuccess }: { onSuccess: () => void }) {
-  const [error, setError] = useState("");
-  const [needsBootstrap, setNeedsBootstrap] = useState(false);
-  useEffect(() => { api<{ needs_bootstrap: boolean }>("/auth/bootstrap/status").then((x) => setNeedsBootstrap(x.needs_bootstrap)).catch(() => undefined); }, []);
+  const { t } = useI18n();
+  const [error, setError] = useState<MessageState>(null);
+  const [needsBootstrap, setNeedsBootstrap] = useState<boolean | null>(null);
+  useEffect(() => { api<{ needs_bootstrap: boolean }>("/auth/bootstrap/status").then((x) => setNeedsBootstrap(x.needs_bootstrap)).catch(() => setNeedsBootstrap(false)); }, []);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     try {
       await api("/auth/login", { method: "POST", body: JSON.stringify({ username: form.get("username"), password: form.get("password"), totp_code: form.get("totp") }) });
       onSuccess();
-    } catch (error) { setError(error instanceof Error && error.message === "rate_limited" ? "試行回数が多すぎます。しばらく待ってから再試行してください。" : "ユーザー名、パスワード、または認証コードを確認してください。"); }
+    } catch (submitError) { setError(message(submitError instanceof Error && submitError.message === "rate_limited" ? "auth.error.rateLimited" : "auth.error.credentials")); }
   }
+  if (needsBootstrap === null) return <main className="login-shell"><section className="login-card"><div className="brand-orbit large"><span /></div><p>{t("loading.connecting")}</p></section></main>;
   if (needsBootstrap) return <Bootstrap onDone={() => setNeedsBootstrap(false)} />;
-  return <main className="login-page"><section className="login-panel"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">SECURE OPERATOR ACCESS</p><h1>ノード運用へログイン</h1><p className="muted">管理操作はすべて記録され、再起動には再認証が必要です。</p><form onSubmit={submit}><label>ユーザー名<input name="username" autoComplete="username" required /></label><label>パスワード<input type="password" name="password" autoComplete="current-password" required /></label><label>認証コードまたはrecovery code<input name="totp" autoComplete="one-time-code" required /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button" type="submit">ログイン</button></form></section></main>;
+  return <main className="login-page"><LanguageToggle className="login-language-toggle" /><div className="login-layout"><section className="login-panel" aria-labelledby="login-title"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">{t("auth.eyebrow")}</p><h1 id="login-title">{t("auth.title")}</h1><p className="muted">{t("auth.description")}</p><form onSubmit={submit}><label>{t("auth.username")}<input name="username" autoComplete="username" required /></label><label>{t("auth.password")}<input type="password" name="password" autoComplete="current-password" required /></label><label>{t("auth.code")}<input name="totp" autoComplete="one-time-code" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<button className="primary-button" type="submit">{t("auth.submit")}</button></form></section><PublicStatusCard /></div></main>;
+}
+
+function PublicStatusCard() {
+  const { t, formatDateTime, formatNumber } = useI18n();
+  const [status, setStatus] = useState<PublicNodeStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let stopped = false;
+    let current: AbortController | null = null;
+    async function load() {
+      current?.abort();
+      current = new AbortController();
+      try {
+        const next = await publicStatusApi(current.signal);
+        if (!stopped) {
+          setStatus(next);
+          setFailed(false);
+          setLoading(false);
+        }
+      } catch (loadError) {
+        if (loadError instanceof DOMException && loadError.name === "AbortError") return;
+        if (!stopped) {
+          setStatus(null);
+          setFailed(true);
+          setLoading(false);
+        }
+      }
+    }
+    void load();
+    const timer = window.setInterval(load, 30_000);
+    return () => {
+      stopped = true;
+      current?.abort();
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const overall = status?.overall ?? "unavailable";
+  const node = status?.node ?? "unknown";
+  const sync = status?.sync ?? "unknown";
+  const overallKey = `publicStatus.overall.${overall}` as MessageKey;
+  const nodeKey = `publicStatus.node.${node}` as MessageKey;
+  const syncKey = `publicStatus.sync.${sync}` as MessageKey;
+  const summary = loading ? t("publicStatus.loading") : failed ? t("publicStatus.unavailable") : t(`publicStatus.description.${overall}` as MessageKey);
+
+  return <section className={`public-status-card ${overall}`} aria-labelledby="public-status-title" aria-busy={loading}>
+    <div className="public-status-network"><span className="pulse-dot" aria-hidden="true" />KUSAMA · SHIDEN</div>
+    <p className="eyebrow">{t("publicStatus.eyebrow")}</p>
+    <h2 id="public-status-title">{t("publicStatus.title")}</h2>
+    <div className="public-status-summary" aria-live="polite">
+      <span className={`public-status-pill ${overall}`}><i aria-hidden="true" />{loading ? t("publicStatus.checking") : t(overallKey)}</span>
+      <p>{summary}</p>
+    </div>
+    <dl className="public-status-grid">
+      <div><dt>{t("publicStatus.node")}</dt><dd><span className={`public-state-dot ${node}`} aria-hidden="true" />{t(nodeKey)}</dd></div>
+      <div><dt>{t("publicStatus.sync")}</dt><dd><span className={`public-state-dot ${sync}`} aria-hidden="true" />{t(syncKey)}</dd></div>
+      <div className="public-status-block"><dt>{t("publicStatus.finalizedBlock")}</dt><dd>{status?.finalized_block == null ? "—" : formatNumber(status.finalized_block)}</dd></div>
+    </dl>
+    <p className="public-status-observed">{t("publicStatus.observedAt")}: <time dateTime={status?.observed_at ?? undefined}>{status?.observed_at ? formatDateTime(status.observed_at) : "—"}</time></p>
+  </section>;
 }
 
 function Bootstrap({ onDone }: { onDone: () => void }) {
-  const [error, setError] = useState("");
+  const { t } = useI18n();
+  const [error, setError] = useState<MessageState>(null);
   const [setup, setSetup] = useState<{ token: string; username: string; secret: string; recovery: string[] } | null>(null);
-  async function start(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); try { const result = await api<{ secret: string; recovery_codes: string[] }>("/auth/bootstrap/start", { method: "POST", body: JSON.stringify({ token: form.get("token"), username: form.get("username"), password: form.get("password") }) }); setSetup({ token: String(form.get("token")), username: String(form.get("username")), secret: result.secret, recovery: result.recovery_codes }); setError(""); } catch { setError("bootstrap tokenとパスワード要件を確認してください。"); } }
-  async function confirm(event: FormEvent<HTMLFormElement>) { event.preventDefault(); if (!setup) return; const form = new FormData(event.currentTarget); try { await api("/auth/bootstrap/confirm", { method: "POST", body: JSON.stringify({ token: setup.token, username: setup.username, totp_code: form.get("totp") }) }); onDone(); } catch { setError("認証コードを確認してください。"); } }
-  return <main className="login-page"><section className="login-panel setup-panel"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">FIRST OPERATOR SETUP</p><h1>初期管理者を設定</h1>{!setup ? <><p className="muted">デプロイ時のbootstrap tokenを使います。パスワードは14文字以上・3種類以上の文字種が必要です。</p><form onSubmit={start}><label>Bootstrap token<input name="token" type="password" required /></label><label>ユーザー名<input name="username" required /></label><label>管理者パスワード<input name="password" type="password" minLength={14} required /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button">TOTPを準備</button></form></> : <><p className="muted">認証アプリへsecretを登録し、recovery codesを安全な場所へ保存してください。</p><code className="setup-secret">{setup.secret}</code><div className="recovery-grid">{setup.recovery.map((code) => <code key={code}>{code}</code>)}</div><form onSubmit={confirm}><label>認証アプリの6桁コード<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button">管理者を有効化</button></form></>}</section></main>;
+  async function start(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); try { const result = await api<{ secret: string; recovery_codes: string[] }>("/auth/bootstrap/start", { method: "POST", body: JSON.stringify({ token: form.get("token"), username: form.get("username"), password: form.get("password") }) }); setSetup({ token: String(form.get("token")), username: String(form.get("username")), secret: result.secret, recovery: result.recovery_codes }); setError(null); } catch { setError(message("bootstrap.error.start")); } }
+  async function confirm(event: FormEvent<HTMLFormElement>) { event.preventDefault(); if (!setup) return; const form = new FormData(event.currentTarget); try { await api("/auth/bootstrap/confirm", { method: "POST", body: JSON.stringify({ token: setup.token, username: setup.username, totp_code: form.get("totp") }) }); onDone(); } catch { setError(message("bootstrap.error.code")); } }
+  return <main className="login-page"><LanguageToggle className="login-language-toggle" /><section className="login-panel setup-panel"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">{t("bootstrap.eyebrow")}</p><h1>{t("bootstrap.title")}</h1>{!setup ? <><p className="muted">{t("bootstrap.description")}</p><form onSubmit={start}><label>{t("bootstrap.token")}<input name="token" type="password" required /></label><label>{t("bootstrap.username")}<input name="username" required /></label><label>{t("bootstrap.password")}<input name="password" type="password" minLength={14} required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<button className="primary-button">{t("bootstrap.prepare")}</button></form></> : <><p className="muted">{t("bootstrap.saveCodes")}</p><code className="setup-secret">{setup.secret}</code><div className="recovery-grid">{setup.recovery.map((code) => <code key={code}>{code}</code>)}</div><form onSubmit={confirm}><label>{t("bootstrap.code")}<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<button className="primary-button">{t("bootstrap.activate")}</button></form></>}</section></main>;
 }
 
 function OverviewTab({ data, demo, onRestart }: { data: Overview; demo: boolean; onRestart: () => void }) {
+  const { t, formatNumber, formatDuration, formatUptime, formatPlanck, formatEnum, formatItemCount } = useI18n();
   const healthy = data.node.service_state === "active" && data.chain.status === "healthy";
   const demoBlocks = useMemo<LoadedSeries[]>(() => {
     const external = chartValues.map((_, index) => 9_842_610 + index * 4);
     const local = external.map((value, index) => value - (index % 7 === 0 ? 3 : index % 5 === 0 ? 1 : 0));
     return [
-      { id: "guardian_local_finalized", label: "ローカル finalized", metric: { __name__: "guardian_local_finalized" }, points: makeDemoPoints(local, "30m") },
-      { id: "guardian_external_height", label: "外部RPC", metric: { __name__: "guardian_external_height" }, points: makeDemoPoints(external, "30m") },
+      { id: "guardian_local_finalized", label: t("overview.localFinalized"), metric: { __name__: "guardian_local_finalized" }, points: makeDemoPoints(local, "30m") },
+      { id: "guardian_external_height", label: t("overview.externalRpc"), metric: { __name__: "guardian_external_height" }, points: makeDemoPoints(external, "30m") },
     ];
-  }, []);
+  }, [t]);
   const blocks = usePrometheusPanel("blocks", "30m", demo, demoBlocks);
   const blockSeries = useMemo<ChartSeries[]>(() => blocks.series.map((item) => {
     const external = item.id.includes("external");
-    return { ...item, label: external ? "外部RPC" : "ローカル finalized", color: external ? "#5bb8ff" : "#a78bfa" };
-  }).sort((left) => left.id.includes("local") ? -1 : 1), [blocks.series]);
+    return { ...item, label: external ? t("overview.externalRpc") : t("overview.localFinalized"), color: external ? "#5bb8ff" : "#a78bfa" };
+  }).sort((left) => left.id.includes("local") ? -1 : 1), [blocks.series, t]);
   const blockValues = seriesValues(blockSeries);
   const blockMin = blockValues.length ? Math.min(...blockValues) : 0;
   const blockMax = blockValues.length ? Math.max(...blockValues) : 1;
@@ -351,58 +441,60 @@ function OverviewTab({ data, demo, onRestart }: { data: Overview; demo: boolean;
 
   return <div className="page-content">
     <section className="hero-status">
-      <div className="hero-copy"><span className={healthy ? "status-pill healthy" : "status-pill critical"}><i />{healthy ? "ALL SYSTEMS NOMINAL" : "ATTENTION REQUIRED"}</span><h2>{healthy ? "Collatorは正常に稼働中" : "確認が必要な状態です"}</h2><p>ローカル状態と2系統の公開RPCを照合しています。現在、自動操作の条件は成立していません。</p></div>
-      <div className="block-readout"><span>FINALIZED BLOCK</span><strong>{fmtNumber(data.chain.local_finalized)}</strong><small>外部差分 <b>{data.chain.lag}</b> blocks</small></div>
+      <div className="hero-copy"><span className={healthy ? "status-pill healthy" : "status-pill critical"}><i />{healthy ? t("overview.healthyBadge") : t("overview.attentionBadge")}</span><h2>{healthy ? t("overview.healthyTitle") : t("overview.attentionTitle")}</h2><p>{t("overview.heroText")}</p></div>
+      <div className="block-readout"><span>FINALIZED BLOCK</span><strong>{formatNumber(data.chain.local_finalized)}</strong><small>{t("overview.externalDifference", { count: data.chain.lag })}</small></div>
     </section>
 
     <div className="metric-grid">
-      <MetricCard label="SERVICE" value={data.node.service_state.toUpperCase()} sub={`稼働 ${fmtUptime(data.node.uptime_seconds)}`} accent="green" />
-      <MetricCard label="PEERS" value={String(data.chain.peers)} sub="警告しきい値 3" accent="violet" />
-      <MetricCard label="CPU" value={`${data.host.cpu_percent.toFixed(0)}%`} sub={`温度 ${data.host.temperature_c.toFixed(0)}°C`} accent="blue" />
-      <MetricCard label="MEMORY" value={`${data.host.memory_percent.toFixed(0)}%`} sub="10分平均は正常" accent="amber" />
+      <MetricCard label="SERVICE" value={formatEnum(data.node.service_state).toUpperCase()} sub={t("overview.serviceUptime", { duration: formatUptime(data.node.uptime_seconds) })} accent="green" />
+      <MetricCard label="PEERS" value={String(data.chain.peers)} sub={t("overview.peerThreshold")} accent="violet" />
+      <MetricCard label="CPU" value={`${data.host.cpu_percent.toFixed(0)}%`} sub={t("overview.temperature", { value: data.host.temperature_c.toFixed(0) })} accent="blue" />
+      <MetricCard label="MEMORY" value={`${data.host.memory_percent.toFixed(0)}%`} sub={t("overview.memoryNormal")} accent="amber" />
     </div>
 
     <div className="dashboard-grid">
-      <section className="panel chain-panel"><PanelTitle overline="CHAIN PROGRESS" title="ブロック進行" action="直近30分" /><TimeSeriesChart ariaLabel="ローカルと外部RPCのブロック高" series={blockSeries} loading={blocks.loading} error={blocks.error} yDomain={[Math.max(0, blockMin - blockPadding), blockMax + blockPadding]} formatValue={(value) => fmtNumber(Math.round(value))} /><div className="chain-stats"><div><span>LOCAL BEST</span><strong>{fmtNumber(data.chain.local_best)}</strong></div><div><span>EXTERNAL</span><strong>{fmtNumber(data.chain.external_height)}</strong></div><div><span>SYNC LAG</span><strong>{data.chain.lag} blocks</strong></div></div></section>
-      <section className="panel health-panel"><PanelTitle overline="HOST HEALTH" title="ホスト余力" /><Gauge label="メモリ" value={data.host.memory_percent} warn={90} /><Gauge label="ディスク" value={data.host.disk_percent} warn={85} /><Gauge label="CPU" value={data.host.cpu_percent} warn={90} /><div className="health-note"><span className="tiny-dot" /> 自動復旧を妨げるリソース異常はありません</div></section>
-      <section className="panel reward-overview-panel"><PanelTitle overline="COLLATOR REWARDS" title="報酬・ブロック生成" action={data.rewards.status.toUpperCase()} /><div className="reward-status-line"><span className={`reward-health ${data.rewards.status}`}><i />{data.rewards.active_session ? "ACTIVE SET" : "NOT ACTIVE"}</span><span>証拠 {data.rewards.quorum}/3</span></div><dl className="reward-overview-stats"><div><dt>最終報酬</dt><dd>{data.rewards.last_reward_at ? `${fmtDuration(data.rewards.seconds_since_reward)}前` : "収集中"}</dd></div><div><dt>24時間</dt><dd>{fmtPlanck(data.rewards.reward_24h_planck)}</dd><small>{fmtNumber(data.rewards.reward_24h_count)} blocks</small></div><div><dt>ウォレット残高</dt><dd>{fmtPlanck(data.rewards.wallet_free_planck)}</dd></div></dl><p className="panel-note">報酬異常は通知とAI診断のみを行い、自動再起動の根拠には使用しません。</p></section>
-      <section className="panel incident-panel"><PanelTitle overline="LATEST SIGNAL" title="直近のインシデント" action={`${data.incidents.length}件`} />{data.incidents.length ? data.incidents.slice(0, 2).map((item) => <IncidentRow key={item.id} item={item} />) : <Empty title="インシデントはありません" text="異常を検知すると、証拠とAI診断がここに表示されます。" />}</section>
-      <section className="panel automation-panel"><PanelTitle overline="REMEDIATION" title="復旧ガード" /><div className="guard-state"><span className="guard-icon">G</span><div><strong>{data.automation.host_locked ? "緊急停止ロック中" : data.automation.enabled ? "自動復旧 有効" : "観測モード"}</strong><p>{data.automation.host_locked ? "ホスト側で全restartを拒否しています。" : data.automation.enabled ? "安全条件が成立した場合のみ再起動します。" : "AIは診断しますが、自動操作は行いません。"}</p></div></div><ul className="guard-list"><li><span>AI confidence</span><b>0.90以上</b></li><li><span>Cooldown</span><b>60分</b></li><li><span>上限</span><b>2回 / 24時間</b></li></ul><button className="outline-button danger" onClick={onRestart}>手動再起動を開く</button></section>
+      <section className="panel chain-panel"><PanelTitle overline="CHAIN PROGRESS" title={t("overview.chainProgress")} action={t("overview.last30m")} /><TimeSeriesChart ariaLabel={t("overview.chainChart")} series={blockSeries} loading={blocks.loading} error={blocks.error} yDomain={[Math.max(0, blockMin - blockPadding), blockMax + blockPadding]} formatValue={(value) => formatNumber(Math.round(value))} /><div className="chain-stats"><div><span>LOCAL BEST</span><strong>{formatNumber(data.chain.local_best)}</strong></div><div><span>EXTERNAL</span><strong>{formatNumber(data.chain.external_height)}</strong></div><div><span>SYNC LAG</span><strong>{data.chain.lag} blocks</strong></div></div></section>
+      <section className="panel health-panel"><PanelTitle overline="HOST HEALTH" title={t("overview.hostCapacity")} /><Gauge label={t("overview.memory")} value={data.host.memory_percent} warn={90} /><Gauge label={t("overview.disk")} value={data.host.disk_percent} warn={85} /><Gauge label="CPU" value={data.host.cpu_percent} warn={90} /><div className="health-note"><span className="tiny-dot" /> {t("overview.resourceHealthy")}</div></section>
+      <section className="panel reward-overview-panel"><PanelTitle overline="COLLATOR REWARDS" title={t("overview.rewardsTitle")} action={formatEnum(data.rewards.status).toUpperCase()} /><div className="reward-status-line"><span className={`reward-health ${data.rewards.status}`}><i />{data.rewards.active_session ? t("overview.activeSet") : t("overview.notActive")}</span><span>{t("overview.evidenceQuorum", { count: data.rewards.quorum })}</span></div><dl className="reward-overview-stats"><div><dt>{t("overview.lastReward")}</dt><dd>{data.rewards.last_reward_at ? t("overview.ago", { duration: formatDuration(data.rewards.seconds_since_reward) }) : t("common.collecting")}</dd></div><div><dt>{t("overview.last24h")}</dt><dd>{formatPlanck(data.rewards.reward_24h_planck)}</dd><small>{formatNumber(data.rewards.reward_24h_count)} blocks</small></div><div><dt>{t("overview.walletBalance")}</dt><dd>{formatPlanck(data.rewards.wallet_free_planck)}</dd></div></dl><p className="panel-note">{t("overview.rewardPolicy")}</p></section>
+      <section className="panel incident-panel"><PanelTitle overline="LATEST SIGNAL" title={t("overview.latestIncident")} action={formatItemCount(data.incidents.length)} />{data.incidents.length ? data.incidents.slice(0, 2).map((item) => <IncidentRow key={item.id} item={item} />) : <Empty title={t("overview.noIncidents")} text={t("overview.noIncidentsText")} />}</section>
+      <section className="panel automation-panel"><PanelTitle overline="REMEDIATION" title={t("overview.remediationGuard")} /><div className="guard-state"><span className="guard-icon">G</span><div><strong>{data.automation.host_locked ? t("overview.guardLocked") : data.automation.enabled ? t("overview.guardEnabled") : t("overview.guardObserve")}</strong><p>{data.automation.host_locked ? t("overview.guardLockedText") : data.automation.enabled ? t("overview.guardEnabledText") : t("overview.guardObserveText")}</p></div></div><ul className="guard-list"><li><span>AI confidence</span><b>{t("overview.minimumConfidence")}</b></li><li><span>Cooldown</span><b>{t("overview.cooldown")}</b></li><li><span>{t("overview.limitLabel")}</span><b>{t("overview.limit")}</b></li></ul><button className="outline-button danger" onClick={onRestart}>{t("overview.openRestart")}</button></section>
     </div>
   </div>;
 }
 
 function MetricsTab({ data, demo }: { data: Overview; demo: boolean }) {
+  const { t, formatBlockCount } = useI18n();
   const [range, setRange] = useState("24h");
   const demoSeries = useMemo(() => ({
     cpu: [{ id: "guardian_host_cpu_percent", label: "CPU", metric: {}, points: makeDemoPoints(chartValues, range) }],
-    memory: [{ id: "guardian_host_memory_percent", label: "メモリ", metric: {}, points: makeDemoPoints(chartValues.map((value) => Math.min(94, value + 14)), range) }],
-    peers: [{ id: "guardian_peers", label: "Peer数", metric: {}, points: makeDemoPoints(chartValues.map((value) => Math.round(value * 0.45 + 17)), range) }],
-    lag: [{ id: "guardian_sync_lag", label: "同期差", metric: {}, points: makeDemoPoints([2, 1, 0, 3, 2, 4, 1, 0, 6, 3, 2, 1, 0, 4, 2, 1, 0, 3, 2, 1, 0, 0, 5, 3, 2, 1, 0, 2, 1, 0], range) }],
-  }), [range]);
+    memory: [{ id: "guardian_host_memory_percent", label: t("overview.memory"), metric: {}, points: makeDemoPoints(chartValues.map((value) => Math.min(94, value + 14)), range) }],
+    peers: [{ id: "guardian_peers", label: t("metrics.peers"), metric: {}, points: makeDemoPoints(chartValues.map((value) => Math.round(value * 0.45 + 17)), range) }],
+    lag: [{ id: "guardian_sync_lag", label: t("metrics.lag"), metric: {}, points: makeDemoPoints([2, 1, 0, 3, 2, 4, 1, 0, 6, 3, 2, 1, 0, 4, 2, 1, 0, 3, 2, 1, 0, 0, 5, 3, 2, 1, 0, 2, 1, 0], range) }],
+  }), [range, t]);
   const cpu = usePrometheusPanel("cpu", range, demo, demoSeries.cpu);
   const memory = usePrometheusPanel("memory", range, demo, demoSeries.memory);
   const peers = usePrometheusPanel("peers", range, demo, demoSeries.peers);
   const lag = usePrometheusPanel("lag", range, demo, demoSeries.lag);
 
   const definitions = [
-    { id: "cpu", label: "CPU使用率", current: data.host.cpu_percent, state: cpu, color: "#5bb8ff", fill: true, curve: "linear" as const, thresholds: [{ value: 90, label: "高負荷の目安 90%", color: "#ff6b7a", band: "above" as const }], domain: [0, 100] as [number, number], format: (value: number) => `${value.toFixed(0)}%`, stats: (values: number[]) => [{ label: "現在", value: latestValue(cpu.series) ?? data.host.cpu_percent }, { label: "平均", value: average(values) }, { label: "最大", value: values.length ? Math.max(...values) : data.host.cpu_percent }] },
-    { id: "memory", label: "メモリ使用率", current: data.host.memory_percent, state: memory, color: "#f2bd66", fill: true, curve: "linear" as const, thresholds: [{ value: 90, label: "重大 90%", color: "#ff6b7a", band: "above" as const }], domain: [0, 100] as [number, number], format: (value: number) => `${value.toFixed(0)}%`, stats: (values: number[]) => [{ label: "現在", value: latestValue(memory.series) ?? data.host.memory_percent }, { label: "平均", value: average(values) }, { label: "最大", value: values.length ? Math.max(...values) : data.host.memory_percent }] },
-    { id: "peers", label: "Peer数", current: data.chain.peers, state: peers, color: "#50e3a4", fill: false, curve: "step" as const, thresholds: [{ value: 3, label: "警告 3未満", color: "#ff6b7a", band: "below" as const }], domain: [0, Math.max(6, Math.ceil(Math.max(0, ...seriesValues(peers.series)) * 1.15))] as [number, number], format: (value: number) => `${Math.round(value)}`, stats: (values: number[]) => [{ label: "現在", value: latestValue(peers.series) ?? data.chain.peers }, { label: "最小", value: values.length ? Math.min(...values) : data.chain.peers }, { label: "平均", value: average(values) }] },
-    { id: "lag", label: "同期差", current: data.chain.lag, state: lag, color: "#a78bfa", fill: false, curve: "linear" as const, scale: "symlog" as const, thresholds: [{ value: 30, label: "警告 30", color: "#f2bd66" }, { value: 120, label: "重大 120", color: "#ff6b7a" }], domain: [0, Math.max(120, Math.ceil(Math.max(0, ...seriesValues(lag.series)) * 1.1))] as [number, number], format: (value: number) => `${Math.round(value)} blocks`, stats: (values: number[]) => [{ label: "現在", value: latestValue(lag.series) ?? data.chain.lag }, { label: "p95", value: percentile(values, 0.95) }, { label: "最大", value: values.length ? Math.max(...values) : data.chain.lag }] },
+    { id: "cpu", label: t("metrics.cpu"), current: data.host.cpu_percent, state: cpu, color: "#5bb8ff", fill: true, curve: "linear" as const, thresholds: [{ value: 90, label: t("metrics.highLoad"), color: "#ff6b7a", band: "above" as const }], domain: [0, 100] as [number, number], format: (value: number) => `${value.toFixed(0)}%`, stats: (values: number[]) => [{ label: t("common.current"), value: latestValue(cpu.series) ?? data.host.cpu_percent }, { label: t("common.average"), value: average(values) }, { label: t("common.maximum"), value: values.length ? Math.max(...values) : data.host.cpu_percent }] },
+    { id: "memory", label: t("metrics.memory"), current: data.host.memory_percent, state: memory, color: "#f2bd66", fill: true, curve: "linear" as const, thresholds: [{ value: 90, label: t("metrics.critical90"), color: "#ff6b7a", band: "above" as const }], domain: [0, 100] as [number, number], format: (value: number) => `${value.toFixed(0)}%`, stats: (values: number[]) => [{ label: t("common.current"), value: latestValue(memory.series) ?? data.host.memory_percent }, { label: t("common.average"), value: average(values) }, { label: t("common.maximum"), value: values.length ? Math.max(...values) : data.host.memory_percent }] },
+    { id: "peers", label: t("metrics.peers"), current: data.chain.peers, state: peers, color: "#50e3a4", fill: false, curve: "step" as const, thresholds: [{ value: 3, label: t("metrics.warningBelow3"), color: "#ff6b7a", band: "below" as const }], domain: [0, Math.max(6, Math.ceil(Math.max(0, ...seriesValues(peers.series)) * 1.15))] as [number, number], format: (value: number) => `${Math.round(value)}`, stats: (values: number[]) => [{ label: t("common.current"), value: latestValue(peers.series) ?? data.chain.peers }, { label: t("common.minimum"), value: values.length ? Math.min(...values) : data.chain.peers }, { label: t("common.average"), value: average(values) }] },
+    { id: "lag", label: t("metrics.lag"), current: data.chain.lag, state: lag, color: "#a78bfa", fill: false, curve: "linear" as const, scale: "symlog" as const, thresholds: [{ value: 30, label: t("metrics.warning30"), color: "#f2bd66" }, { value: 120, label: t("metrics.critical120"), color: "#ff6b7a" }], domain: [0, Math.max(120, Math.ceil(Math.max(0, ...seriesValues(lag.series)) * 1.1))] as [number, number], format: (value: number) => formatBlockCount(Math.round(value)), stats: (values: number[]) => [{ label: t("common.current"), value: latestValue(lag.series) ?? data.chain.lag }, { label: "p95", value: percentile(values, 0.95) }, { label: t("common.maximum"), value: values.length ? Math.max(...values) : data.chain.lag }] },
   ];
 
-  return <div className="page-content"><div className="section-intro"><div><span className="eyebrow">15 SECOND SCRAPE</span><h2>ノードとホストの時系列</h2></div><select aria-label="表示期間" value={range} onChange={(event) => setRange(event.target.value)}><option value="1h">直近1時間</option><option value="24h">直近24時間</option><option value="7d">直近7日</option><option value="30d">直近30日</option></select></div><div className="metrics-layout">{definitions.map((panel) => {
+  return <div className="page-content"><div className="section-intro"><div><span className="eyebrow">15 SECOND SCRAPE</span><h2>{t("metrics.title")}</h2></div><select aria-label={t("metrics.range")} value={range} onChange={(event) => setRange(event.target.value)}><option value="1h">{t("metrics.range.1h")}</option><option value="24h">{t("metrics.range.24h")}</option><option value="7d">{t("metrics.range.7d")}</option><option value="30d">{t("metrics.range.30d")}</option></select></div><div className="metrics-layout">{definitions.map((panel) => {
     const values = seriesValues(panel.state.series);
     const chartSeries: ChartSeries[] = panel.state.series.map((item) => ({ ...item, label: panel.label, color: panel.color, curve: panel.curve, fill: panel.fill }));
-    return <section className="panel metric-chart" key={panel.id}><PanelTitle overline="PROMETHEUS" title={panel.label} action={panel.format(latestValue(panel.state.series) ?? panel.current)} /><TimeSeriesChart ariaLabel={`${panel.label}の時系列`} series={chartSeries} thresholds={panel.thresholds} loading={panel.state.loading} error={panel.state.error} yDomain={panel.domain} scale={"scale" in panel ? panel.scale : "linear"} formatValue={panel.format} summaries={panel.stats(values).map((item) => ({ label: item.label, value: panel.format(item.value) }))} /></section>;
+    return <section className="panel metric-chart" key={panel.id}><PanelTitle overline="PROMETHEUS" title={panel.label} action={panel.format(latestValue(panel.state.series) ?? panel.current)} /><TimeSeriesChart ariaLabel={t("metrics.chartAria", { label: panel.label })} series={chartSeries} thresholds={panel.thresholds} loading={panel.state.loading} error={panel.state.error} yDomain={panel.domain} scale={"scale" in panel ? panel.scale : "linear"} formatValue={panel.format} summaries={panel.stats(values).map((item) => ({ label: item.label, value: panel.format(item.value) }))} /></section>;
   })}</div></div>;
 }
 
 function RewardsTab({ overview, demo }: { overview: RewardOverview; demo: boolean }) {
+  const { t, formatNumber, formatDateTime, formatDuration, formatPlanck, formatEnum, formatItemCount, formatBlockCount } = useI18n();
   const [page, setPage] = useState<RewardPage>({ summary: overview, items: [], daily: [] });
   const [loading, setLoading] = useState(!demo);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<MessageKey>();
   const demoItems = useMemo<RewardObservation[]>(() => Array.from({ length: 24 }, (_, index) => ({
     block_number: 9_842_704 - index * 12,
     block_hash: `0x${String(index).padStart(64, "a")}`,
@@ -417,7 +509,7 @@ function RewardsTab({ overview, demo }: { overview: RewardOverview; demo: boolea
   useEffect(() => {
     if (demo) return;
     let stopped=false; let current:AbortController|null=null;
-    const load=async()=>{ current?.abort(); current=new AbortController(); try { const result=await api<RewardPage>("/rewards?limit=100",{signal:current.signal}); if(!stopped){setPage(result);setLoading(false);setError("");} } catch(e){ if(e instanceof DOMException&&e.name==="AbortError")return; if(!stopped){setLoading(false);setError("報酬履歴を取得できませんでした。15秒後に再試行します。");} } };
+    const load=async()=>{ current?.abort(); current=new AbortController(); try { const result=await api<RewardPage>("/rewards?limit=100",{signal:current.signal}); if(!stopped){setPage(result);setLoading(false);setError(undefined);} } catch(e){ if(e instanceof DOMException&&e.name==="AbortError")return; if(!stopped){setLoading(false);setError("rewards.loadError");} } };
     void load(); const timer=window.setInterval(load,15000); return()=>{stopped=true;current?.abort();window.clearInterval(timer);};
   },[demo]);
 
@@ -426,40 +518,42 @@ function RewardsTab({ overview, demo }: { overview: RewardOverview; demo: boolea
   const chronological = useMemo(()=>[...displayedPage.items].sort((a,b)=>new Date(a.authored_at).getTime()-new Date(b.authored_at).getTime()),[displayedPage.items]);
   const intervals = useMemo<ChartSeries[]>(()=>{
     const points=chronological.slice(1).map((item,index)=>({timestamp:new Date(item.authored_at).getTime()/1000,value:(new Date(item.authored_at).getTime()-new Date(chronological[index].authored_at).getTime())/1000}));
-    return points.length?[{id:"reward_interval",label:"報酬間隔",metric:{},points,color:"#50e3a4"}]:[];
-  },[chronological]);
-  const cumulativeDemo = useMemo<LoadedSeries[]>(()=>[{id:"guardian_collator_reward_sdn_total",label:"累計報酬",metric:{__name__:"guardian_collator_reward_sdn_total"},points:makeDemoPoints(chartValues.map((_,i)=>810+i*2),"24h")}],[]);
+    return points.length?[{id:"reward_interval",label:t("rewards.interval"),metric:{},points,color:"#50e3a4"}]:[];
+  },[chronological,t]);
+  const cumulativeDemo = useMemo<LoadedSeries[]>(()=>[{id:"guardian_collator_reward_sdn_total",label:t("rewards.cumulative"),metric:{__name__:"guardian_collator_reward_sdn_total"},points:makeDemoPoints(chartValues.map((_,i)=>810+i*2),"24h")}],[t]);
   const prometheus=usePrometheusPanel("rewards","24h",demo,cumulativeDemo);
-  const cumulative=useMemo<ChartSeries[]>(()=>prometheus.series.filter(item=>item.id.includes("reward_sdn_total")).map(item=>({...item,label:"累計報酬",color:"#a78bfa",fill:true})),[prometheus.series]);
+  const cumulative=useMemo<ChartSeries[]>(()=>prometheus.series.filter(item=>item.id.includes("reward_sdn_total")).map(item=>({...item,label:t("rewards.cumulative"),color:"#a78bfa",fill:true})),[prometheus.series,t]);
   const cumulativeValues=seriesValues(cumulative); const cumulativeMin=cumulativeValues.length?Math.min(...cumulativeValues):0; const cumulativeMax=cumulativeValues.length?Math.max(...cumulativeValues):1;
   const intervalValues=seriesValues(intervals); const intervalMax=Math.max(1800,...intervalValues);
 
   return <div className="page-content reward-page">
-    <div className="section-intro"><div><span className="eyebrow">ON-CHAIN REWARD PROOF</span><h2>ブロック生成報酬</h2><p className="section-copy">ローカルRPCと外部2系統で、作成block・報酬ポット・ウォレット入金を照合します。</p></div><a className="outline-button reward-link" href={`https://shiden.subscan.io/account/${summary.address}`} target="_blank" rel="noreferrer">Subscanで確認 ↗</a></div>
-    <section className={`reward-hero ${summary.status}`}><div><span className={`reward-health ${summary.status}`}><i />{summary.status.toUpperCase()}</span><h3>{summary.active_session ? "コレーター報酬を正常に確認中" : "active setを確認してください"}</h3><p>{summary.last_reward_at ? `最終確認 ${fmtTime(summary.last_reward_at)}（${fmtDuration(summary.seconds_since_reward)}前）` : "監視開始後の最初の報酬を待っています。"}</p></div><div className="reward-address"><span>REWARD WALLET</span><code title={summary.address}>{summary.address}</code><small>runtime spec {summary.spec_version || "—"} · quorum {summary.quorum}/3</small></div></section>
+    <div className="section-intro"><div><span className="eyebrow">ON-CHAIN REWARD PROOF</span><h2>{t("rewards.title")}</h2><p className="section-copy">{t("rewards.description")}</p></div><a className="outline-button reward-link" href={`https://shiden.subscan.io/account/${summary.address}`} target="_blank" rel="noreferrer">{t("rewards.openSubscan")}</a></div>
+    <section className={`reward-hero ${summary.status}`}><div><span className={`reward-health ${summary.status}`}><i />{formatEnum(summary.status).toUpperCase()}</span><h3>{summary.active_session ? t("rewards.monitoringHealthy") : t("rewards.checkActiveSet")}</h3><p>{summary.last_reward_at ? t("rewards.lastConfirmed", { time: formatDateTime(summary.last_reward_at), duration: formatDuration(summary.seconds_since_reward) }) : t("rewards.waitingFirst")}</p></div><div className="reward-address"><span>REWARD WALLET</span><code title={summary.address}>{summary.address}</code><small>runtime spec {summary.spec_version || "—"} · quorum {summary.quorum}/3</small></div></section>
     <div className="reward-card-grid">
-      <MetricCard label="ACTIVE SET" value={summary.active_session ? `${summary.validator_count}中` : "対象外"} sub={summary.active_session ? "現セッションに所属" : "重大確認が必要"} accent={summary.active_session ? "green" : "amber"} />
-      <MetricCard label="LAST REWARD" value={summary.last_reward_at ? fmtDuration(summary.seconds_since_reward) : "収集中"} sub={`block #${fmtNumber(summary.last_authored_block || 0)}`} accent="violet" />
-      <MetricCard label="24 HOURS" value={fmtPlanck(summary.reward_24h_planck)} sub={`${fmtNumber(summary.reward_24h_count)} blocks`} accent="blue" />
-      <MetricCard label="WALLET" value={fmtPlanck(summary.wallet_free_planck)} sub="free balance" accent="amber" />
+      <MetricCard label="ACTIVE SET" value={summary.active_session ? t("rewards.inSet", { count: summary.validator_count }) : t("rewards.notApplicable")} sub={summary.active_session ? t("rewards.currentSession") : t("rewards.needsAttention")} accent={summary.active_session ? "green" : "amber"} />
+      <MetricCard label="LAST REWARD" value={summary.last_reward_at ? formatDuration(summary.seconds_since_reward) : t("common.collecting")} sub={`block #${formatNumber(summary.last_authored_block || 0)}`} accent="violet" />
+      <MetricCard label="24 HOURS" value={formatPlanck(summary.reward_24h_planck)} sub={formatBlockCount(summary.reward_24h_count)} accent="blue" />
+      <MetricCard label="WALLET" value={formatPlanck(summary.wallet_free_planck)} sub={t("overview.walletBalance")} accent="amber" />
     </div>
-    {(summary.gap||!summary.schema_ok||summary.quorum<2)&&<div className="reward-warning" role="status">報酬未取得とは判定していません。監視証拠が不足しています。{summary.gap&&<small>{summary.gap}</small>}</div>}
+    {(summary.gap||!summary.schema_ok||summary.quorum<2)&&<div className="reward-warning" role="status">{t("rewards.warningEvidence")}{summary.gap&&<small>{summary.gap}</small>}</div>}
     <div className="metrics-layout reward-charts">
-      <section className="panel metric-chart"><PanelTitle overline="PROMETHEUS" title="累計報酬" action={fmtPlanck(summary.reward_total_planck)} /><TimeSeriesChart ariaLabel="累計報酬の時系列" series={cumulative} loading={prometheus.loading} error={prometheus.error} yDomain={[Math.max(0,cumulativeMin-(cumulativeMax-cumulativeMin)*.1),cumulativeMax+(cumulativeMax-cumulativeMin||1)*.1]} formatValue={(value)=>`${value.toFixed(3)} SDN`} /></section>
-      <section className="panel metric-chart"><PanelTitle overline="AUTHORSHIP" title="報酬間隔" action={summary.last_reward_at?fmtDuration(summary.seconds_since_reward):"収集中"} /><TimeSeriesChart ariaLabel="ブロック生成報酬の間隔" series={intervals} loading={loading} error={error} thresholds={[{value:900,label:"警告 15分",color:"#f2bd66"},{value:1800,label:"重大 30分",color:"#ff6b7a"}]} yDomain={[0,intervalMax]} formatValue={(value)=>fmtDuration(Math.round(value))} /></section>
+      <section className="panel metric-chart"><PanelTitle overline="PROMETHEUS" title={t("rewards.cumulative")} action={formatPlanck(summary.reward_total_planck)} /><TimeSeriesChart ariaLabel={t("rewards.cumulativeChart")} series={cumulative} loading={prometheus.loading} error={prometheus.error} yDomain={[Math.max(0,cumulativeMin-(cumulativeMax-cumulativeMin)*.1),cumulativeMax+(cumulativeMax-cumulativeMin||1)*.1]} formatValue={(value)=>`${value.toFixed(3)} SDN`} /></section>
+      <section className="panel metric-chart"><PanelTitle overline="AUTHORSHIP" title={t("rewards.interval")} action={summary.last_reward_at?formatDuration(summary.seconds_since_reward):t("common.collecting")} /><TimeSeriesChart ariaLabel={t("rewards.intervalChart")} series={intervals} loading={loading} error={error} thresholds={[{value:900,label:t("rewards.warning15m"),color:"#f2bd66"},{value:1800,label:t("rewards.critical30m"),color:"#ff6b7a"}]} yDomain={[0,intervalMax]} formatValue={(value)=>formatDuration(Math.round(value))} /></section>
     </div>
-    <section className="panel reward-daily"><PanelTitle overline="DAILY TOTAL" title="日別報酬" action="JST" /><DailyRewardBars items={displayedPage.daily||[]} /></section>
-    <section className="panel reward-ledger"><PanelTitle overline="VERIFIED LEDGER" title="最近の報酬" action={`${displayedPage.items.length}件`} />{displayedPage.items.length?<div className="reward-table"><div className="reward-table-head"><span>BLOCK</span><span>JST</span><span>確認額</span><span>検証</span><span>証拠</span></div>{displayedPage.items.map(item=><div className="reward-table-row" key={item.block_number}><a href={`https://shiden.subscan.io/block/${item.block_number}`} target="_blank" rel="noreferrer">#{fmtNumber(item.block_number)}</a><time>{fmtTime(item.authored_at)}</time><span title={`${item.credited_planck} Planck`}>{fmtPlanck(item.credited_planck)}</span><b className={`verification ${item.verification}`}>{item.verification}</b><span>{item.source_count}/3</span></div>)}</div>:<Empty title="報酬履歴を収集中です" text="導入前の履歴は推測せず、監視開始後にfinalizedとなった報酬だけを記録します。" />}</section>
+    <section className="panel reward-daily"><PanelTitle overline="DAILY TOTAL" title={t("rewards.daily")} action="JST" /><DailyRewardBars items={displayedPage.daily||[]} /></section>
+    <section className="panel reward-ledger"><PanelTitle overline="VERIFIED LEDGER" title={t("rewards.recent")} action={formatItemCount(displayedPage.items.length)} />{displayedPage.items.length?<div className="reward-table"><div className="reward-table-head"><span>BLOCK</span><span>JST</span><span>{t("rewards.confirmedAmount")}</span><span>{t("rewards.verification")}</span><span>{t("common.evidence")}</span></div>{displayedPage.items.map(item=><div className="reward-table-row" key={item.block_number}><a href={`https://shiden.subscan.io/block/${item.block_number}`} target="_blank" rel="noreferrer">#{formatNumber(item.block_number)}</a><time>{formatDateTime(item.authored_at)}</time><span title={`${item.credited_planck} Planck`}>{formatPlanck(item.credited_planck)}</span><b className={`verification ${item.verification}`}>{formatEnum(item.verification)}</b><span>{item.source_count}/3</span></div>)}</div>:<Empty title={t("rewards.collectingHistory")} text={t("rewards.collectingHistoryText")} />}</section>
   </div>;
 }
 
 function DailyRewardBars({items}:{items:RewardDaily[]}) {
-  if(!items.length)return <Empty title="日別履歴を収集中です" text="確認済み報酬が蓄積されると日別の合計を表示します。" />;
+  const { t, formatDate, formatBlockCount } = useI18n();
+  if(!items.length)return <Empty title={t("rewards.collectingDaily")} text={t("rewards.collectingDailyText")} />;
   const values=items.map(item=>Number(BigInt(item.amount_planck||"0"))/1e18); const max=Math.max(...values,1);
-  return <div className="daily-bars" role="img" aria-label="日別報酬額"><div className="daily-bars-plot">{items.map((item,index)=><div className="daily-bar-item" key={item.day}><span className="daily-value">{values[index].toFixed(1)}</span><div className="daily-bar-track"><i style={{height:`${Math.max(2,values[index]/max*100)}%`}} /></div><time>{new Intl.DateTimeFormat("ja-JP",{month:"numeric",day:"numeric",timeZone:"Asia/Tokyo"}).format(new Date(`${item.day}T00:00:00+09:00`))}</time><small>{fmtNumber(item.count)} blocks</small></div>)}</div></div>;
+  return <div className="daily-bars" role="img" aria-label={t("rewards.dailyAria")}><div className="daily-bars-plot">{items.map((item,index)=><div className="daily-bar-item" key={item.day}><span className="daily-value">{values[index].toFixed(1)}</span><div className="daily-bar-track"><i style={{height:`${Math.max(2,values[index]/max*100)}%`}} /></div><time>{formatDate(`${item.day}T00:00:00+09:00`)}</time><small>{formatBlockCount(item.count)}</small></div>)}</div></div>;
 }
 
 function LogsTab({ lines, demo }: { lines: LogLine[]; demo: boolean }) {
+  const { t, formatChartTime, formatEnum } = useI18n();
   const [query, setQuery] = useState("");
   const [priority, setPriority] = useState("");
   const [filtered, setFiltered] = useState<LogLine[]>(lines);
@@ -479,15 +573,45 @@ function LogsTab({ lines, demo }: { lines: LogLine[]; demo: boolean }) {
     { cursor: "3", timestamp: "2026-08-04T13:42:03Z", priority: "notice", message: "Starting collation for relay parent 0x19e4…74bd" },
   ];
   const shown = demo ? sample : (filtered.length || query || priority ? filtered : lines);
-  return <div className="page-content"><div className="section-intro"><div><span className="eyebrow">SYSTEMD JOURNAL</span><h2>astar.service ログ</h2></div><div className="log-actions"><input placeholder="ログを検索" aria-label="ログを検索" value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label="優先度" value={priority} onChange={(event) => setPriority(event.target.value)}><option value="">すべて</option><option value="warning">warning以上</option><option value="error">error以上</option></select></div></div><section className="log-viewer"><div className="log-head"><span>JST</span><span>LEVEL</span><span>MESSAGE</span></div>{shown.map((line) => <div className="log-line" key={line.cursor}><time>{fmtTime(line.timestamp).split(" ").pop()}</time><span className={`level ${line.priority}`}>{line.priority}</span><code>{line.message}</code></div>)}{!shown.length && <Empty title="ログを取得できません" text="ホストエージェントとの接続を確認してください。" />}</section></div>;
+  return <div className="page-content"><div className="section-intro"><div><span className="eyebrow">SYSTEMD JOURNAL</span><h2>{t("logs.title")}</h2></div><div className="log-actions"><input placeholder={t("logs.search")} aria-label={t("logs.search")} value={query} onChange={(event) => setQuery(event.target.value)} /><select aria-label={t("logs.priority")} value={priority} onChange={(event) => setPriority(event.target.value)}><option value="">{t("logs.all")}</option><option value="warning">{t("logs.warning")}</option><option value="error">{t("logs.error")}</option></select></div></div><section className="log-viewer"><div className="log-head"><span>JST</span><span>LEVEL</span><span>MESSAGE</span></div>{shown.map((line) => <div className="log-line" key={line.cursor}><time>{formatChartTime(new Date(line.timestamp).getTime() / 1000)}</time><span className={`level ${line.priority}`}>{formatEnum(line.priority)}</span><code>{line.message}</code></div>)}{!shown.length && <Empty title={t("logs.empty")} text={t("logs.emptyText")} />}</section></div>;
+}
+
+const incidentMessageKeys: Record<string, MessageKey> = {
+  "service-inactive": "incident.service-inactive",
+  "block-stalled": "incident.block-stalled",
+  "peers-zero": "incident.peers-zero",
+  "peers-low": "incident.peers-low",
+  "disk-critical": "incident.disk-critical",
+  "disk-warning": "incident.disk-warning",
+  "memory-high": "incident.memory-high",
+  "log-oom": "incident.log-oom",
+  "log-panic": "incident.log-panic",
+  "log-database": "incident.log-database",
+  "reward-active-set-missing": "incident.reward-active-set-missing",
+  "reward-credit-mismatch": "incident.reward-credit-mismatch",
+};
+
+function incidentTitle(item: Incident, t: (key: MessageKey, values?: MessageValues) => string) {
+  const fingerprint = item.fingerprint || "";
+  if (fingerprint.startsWith("manual-diagnosis-")) return t("incident.manual-diagnosis");
+  if (fingerprint === "sync-lag-critical" || fingerprint === "sync-lag-warning") {
+    const lag = typeof item.evidence?.lag === "number" ? item.evidence.lag : "—";
+    return t(fingerprint === "sync-lag-critical" ? "incident.sync-lag-critical" : "incident.sync-lag-warning", { lag });
+  }
+  if (fingerprint === "reward-monitor-degraded") return t(item.evidence?.error ? "incident.reward-monitor-degraded.database" : "incident.reward-monitor-degraded.evidence");
+  if (fingerprint === "reward-silence") return t(item.severity === "critical" ? "incident.reward-silence.critical" : "incident.reward-silence.warning");
+  const key = incidentMessageKeys[fingerprint];
+  return key ? t(key) : item.title;
 }
 
 function IncidentsTab({ incidents, demo, onDiagnose }: { incidents: Incident[]; demo: boolean; onDiagnose: () => void }) {
-  return <div className="page-content"><div className="section-intro"><div><span className="eyebrow">EVIDENCE-BASED TRIAGE</span><h2>検知・診断・復旧の履歴</h2></div><button className="outline-button" onClick={onDiagnose}>現在の状態をAI診断</button></div><section className="panel incident-table"><div className="table-head"><span>重要度</span><span>内容</span><span>状態</span><span>発生日時</span></div>{incidents.map((item) => <div className="table-row" key={item.id}><span><b className={`severity ${item.severity}`}>{item.severity}</b></span><span><strong>{item.title}</strong><small>{item.diagnosis || "診断待ち"}</small></span><span>{item.status}</span><time>{fmtTime(item.opened_at)}</time></div>)}{!incidents.length && <Empty title="履歴はありません" text="検知した異常とAI診断を365日保存します。" />}{demo && <p className="demo-foot">プレビュー用のサンプルインシデントを表示しています。</p>}</section></div>;
+  const { t, formatDateTime, formatEnum } = useI18n();
+  return <div className="page-content"><div className="section-intro"><div><span className="eyebrow">EVIDENCE-BASED TRIAGE</span><h2>{t("incidents.title")}</h2></div><button className="outline-button" onClick={onDiagnose}>{t("incidents.runDiagnosis")}</button></div><section className="panel incident-table"><div className="table-head"><span>{t("incidents.severity")}</span><span>{t("incidents.details")}</span><span>{t("common.status")}</span><span>{t("incidents.opened")}</span></div>{incidents.map((item) => <div className="table-row" key={item.id}><span><b className={`severity ${item.severity}`}>{formatEnum(item.severity)}</b></span><span><strong>{incidentTitle(item, t)}</strong><small>{item.diagnosis || t("incidents.pending")}</small></span><span>{formatEnum(item.status)}</span><time>{formatDateTime(item.opened_at)}</time></div>)}{!incidents.length && <Empty title={t("incidents.empty")} text={t("incidents.emptyText")} />}{demo && <p className="demo-foot">{t("incidents.demo")}</p>}</section></div>;
 }
 
 function MaintenanceTab({ data, onRestart }: { data: Overview; onRestart: () => void }) {
-  return <div className="page-content"><div className="maintenance-hero"><div><span className="eyebrow">CONTROLLED ACTIONS ONLY</span><h2>安全境界内のメンテナンス</h2><p>`astar.service` の再起動だけを許可しています。停止、更新、DB修復、ホスト再起動は実行できません。</p></div><div className="lock-badge">LOCKED SCOPE</div></div><div className="maintenance-grid"><section className="panel"><PanelTitle overline="TARGET" title="astar.service" /><dl className="detail-list"><div><dt>状態</dt><dd className="good">{data.node.service_state}</dd></div><div><dt>再起動回数</dt><dd>{data.node.restart_count}</dd></div><div><dt>Cooldown</dt><dd>60分</dd></div><div><dt>過去24時間</dt><dd>0 / 2</dd></div></dl><button className="primary-button danger-fill" onClick={onRestart}>再起動を申請</button></section><section className="panel"><PanelTitle overline="HARD GUARDS" title="エージェント側の拒否条件" /><ul className="check-list"><li>緊急停止ロックが存在する</li><li>前回操作から60分未満</li><li>24時間で2回以上実行済み</li><li>直前の復旧確認が失敗</li><li>同じaction IDを処理済み</li></ul><p className="panel-note">Webアプリが誤動作しても、ホストエージェントが独立して拒否します。</p></section></div></div>;
+  const { t, formatEnum } = useI18n();
+  return <div className="page-content"><div className="maintenance-hero"><div><span className="eyebrow">CONTROLLED ACTIONS ONLY</span><h2>{t("maintenance.title")}</h2><p>{t("maintenance.description")}</p></div><div className="lock-badge">LOCKED SCOPE</div></div><div className="maintenance-grid"><section className="panel"><PanelTitle overline="TARGET" title="astar.service" /><dl className="detail-list"><div><dt>{t("common.state")}</dt><dd className="good">{formatEnum(data.node.service_state)}</dd></div><div><dt>{t("maintenance.restartCount")}</dt><dd>{data.node.restart_count}</dd></div><div><dt>Cooldown</dt><dd>{t("overview.cooldown")}</dd></div><div><dt>{t("maintenance.past24h")}</dt><dd>0 / 2</dd></div></dl><button className="primary-button danger-fill" onClick={onRestart}>{t("maintenance.requestRestart")}</button></section><section className="panel"><PanelTitle overline="HARD GUARDS" title={t("maintenance.guardTitle")} /><ul className="check-list"><li>{t("maintenance.guard.lock")}</li><li>{t("maintenance.guard.cooldown")}</li><li>{t("maintenance.guard.limit")}</li><li>{t("maintenance.guard.recovery")}</li><li>{t("maintenance.guard.idempotency")}</li></ul><p className="panel-note">{t("maintenance.guardNote")}</p></section></div></div>;
 }
 
 function auditError(item: Audit) {
@@ -495,40 +619,43 @@ function auditError(item: Audit) {
   return typeof value === "string" && value ? value.slice(0, 320) : "";
 }
 
-function SettingsTab({ data, audits, demo, setNotice, onAuditRefresh, onAutomation }: { data: Overview; audits: Audit[]; demo: boolean; setNotice: (x: string) => void; onAuditRefresh: () => Promise<void>; onAutomation: () => void }) {
+function SettingsTab({ data, audits, demo, setNotice, onAuditRefresh, onAutomation }: { data: Overview; audits: Audit[]; demo: boolean; setNotice: (x: MessageState) => void; onAuditRefresh: () => Promise<void>; onAutomation: () => void }) {
+  const { t, formatDateTime, formatEnum } = useI18n();
   const sample: Audit[] = [{ id: "a1", action: "session.login", actor: "admin", created_at: new Date().toISOString(), result: "success" }];
   const [testing, setTesting] = useState<"" | "smtp" | "gemini">("");
   async function testIntegration(kind: "smtp" | "gemini") {
-    if (demo) { setNotice("プレビューでは外部サービスへ接続しません。"); return; }
+    if (demo) { setNotice(message("settings.previewNoExternal")); return; }
     setTesting(kind);
     try {
       await api(`/settings/test-${kind}`, { method: "POST", body: "{}" });
-      setNotice(`${kind === "smtp" ? "SMTP" : "Gemini"}疎通テストをキューへ登録しました。監査履歴へ結果が反映されます。`);
+      setNotice(message("settings.testQueued", { service: kind === "smtp" ? "SMTP" : "Gemini" }));
       await onAuditRefresh();
     } catch {
-      setNotice("疎通テストの登録に失敗しました。");
+      setNotice(message("settings.testFailed"));
     } finally {
       setTesting("");
     }
   }
-  return <div className="page-content"><div className="settings-grid"><section className="panel"><PanelTitle overline="AUTOMATION" title="自動復旧" /><div className="setting-row"><div><strong>観測モード</strong><p>14日間はAI診断のみを蓄積します。</p></div><div><span className="state-chip">{data.automation.host_locked ? "host locked" : data.automation.mode}</span><button className="small-button" onClick={onAutomation}>{data.automation.enabled ? "無効化" : "有効化"}</button></div></div><div className="setting-row"><div><strong>メール通知</strong><p>異常、診断、操作結果を送信します。</p></div><button className="small-button" disabled={testing === "smtp"} onClick={() => testIntegration("smtp")}>{testing === "smtp" ? "登録中…" : "テスト"}</button></div><div className="setting-row"><div><strong>Gemini API</strong><p>store=false・構造化出力</p></div><button className="small-button" disabled={testing === "gemini"} onClick={() => testIntegration("gemini")}>{testing === "gemini" ? "登録中…" : "テスト"}</button></div></section><section className="panel audit-panel"><PanelTitle overline="AUDIT TRAIL" title="監査履歴" />{(demo ? sample : audits).map((item) => { const error = auditError(item); return <div className="audit-row" key={item.id}><span className="audit-mark">A</span><div><strong>{item.action}</strong><small>{item.actor} · {fmtTime(item.created_at)}</small>{error && <small className="audit-error">{error}</small>}</div><b className={`audit-result ${item.result}`}>{item.result}</b></div>; })}</section></div></div>;
+  return <div className="page-content"><div className="settings-grid"><section className="panel"><PanelTitle overline="AUTOMATION" title={t("settings.automation")} /><div className="setting-row"><div><strong>{t("settings.observation")}</strong><p>{t("settings.observationText")}</p></div><div><span className="state-chip">{data.automation.host_locked ? t("settings.hostLocked") : formatEnum(data.automation.mode)}</span><button className="small-button" onClick={onAutomation}>{data.automation.enabled ? t("settings.disable") : t("settings.enable")}</button></div></div><div className="setting-row"><div><strong>{t("settings.email")}</strong><p>{t("settings.emailText")}</p></div><button className="small-button" disabled={testing === "smtp"} onClick={() => testIntegration("smtp")}>{testing === "smtp" ? t("settings.registering") : t("settings.test")}</button></div><div className="setting-row"><div><strong>Gemini API</strong><p>{t("settings.geminiText")}</p></div><button className="small-button" disabled={testing === "gemini"} onClick={() => testIntegration("gemini")}>{testing === "gemini" ? t("settings.registering") : t("settings.test")}</button></div></section><section className="panel audit-panel"><PanelTitle overline="AUDIT TRAIL" title={t("settings.audit")} />{(demo ? sample : audits).map((item) => { const error = auditError(item); return <div className="audit-row" key={item.id}><span className="audit-mark">A</span><div><strong>{item.action}</strong><small>{item.actor} · {formatDateTime(item.created_at)}</small>{error && <small className="audit-error">{error}</small>}</div><b className={`audit-result ${item.result}`}>{formatEnum(item.result)}</b></div>; })}</section></div></div>;
 }
 
-function AutomationDialog({ enabled, onClose, onDone }: { enabled: boolean; onClose: () => void; onDone: (x: string) => void }) {
-  const [error, setError] = useState("");
-  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); try { await api("/settings", { method: "PUT", body: JSON.stringify({ automation_enabled: !enabled, password: form.get("password"), totp_code: form.get("totp") }) }); onDone(`自動復旧を${enabled ? "無効" : "有効"}にしました。`); } catch { setError(enabled ? "設定を変更できませんでした。" : "14日間の観測期間と再認証情報を確認してください。"); } }
-  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="automation-title"><button className="modal-close" onClick={onClose}>×</button><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="automation-title">自動復旧を{enabled ? "無効化" : "有効化"}</h2><p>{enabled ? "自動再起動を停止します。手動操作は引き続き安全条件の対象です。" : "14日間の観測完了後、安全条件がすべて成立した場合だけ自動再起動します。"}</p><form onSubmit={submit}><label>パスワード<input name="password" type="password" required /></label><label>6桁の認証コード<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>キャンセル</button><button type="submit" className="primary-button">設定を保存</button></div></form></section></div>;
+function AutomationDialog({ enabled, onClose, onDone }: { enabled: boolean; onClose: () => void; onDone: (x: MessageState) => void }) {
+  const { t } = useI18n();
+  const [error, setError] = useState<MessageState>(null);
+  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const form = new FormData(event.currentTarget); try { await api("/settings", { method: "PUT", body: JSON.stringify({ automation_enabled: !enabled, password: form.get("password"), totp_code: form.get("totp") }) }); onDone(message(enabled ? "automation.saved.disable" : "automation.saved.enable")); } catch { setError(message(enabled ? "automation.error.disable" : "automation.error.enable")); } }
+  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="automation-title"><button className="modal-close" aria-label={t("common.close")} onClick={onClose}>×</button><LanguageToggle className="modal-language-toggle" /><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="automation-title">{t(enabled ? "automation.title.disable" : "automation.title.enable")}</h2><p>{t(enabled ? "automation.description.disable" : "automation.description.enable")}</p><form onSubmit={submit}><label>{t("common.password")}<input name="password" type="password" required /></label><label>{t("common.authCode")}<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>{t("common.cancel")}</button><button type="submit" className="primary-button">{t("automation.save")}</button></div></form></section></div>;
 }
 
-function RestartDialog({ demo, onClose, onDone }: { demo: boolean; onClose: () => void; onDone: (x: string) => void }) {
-  const [error, setError] = useState("");
+function RestartDialog({ demo, onClose, onDone }: { demo: boolean; onClose: () => void; onDone: (x: MessageState) => void }) {
+  const { t } = useI18n();
+  const [error, setError] = useState<MessageState>(null);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget);
-    if (form.get("confirm") !== "tk_sdn_collator") { setError("確認欄へ tk_sdn_collator と入力してください。"); return; }
-    if (demo) { onDone("プレビューでは再起動を実行しません。操作フローだけを確認しました。"); return; }
-    try { await api("/actions/restart", { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ password: form.get("password"), totp_code: form.get("totp"), reason: form.get("reason"), confirm: form.get("confirm") }) }); onDone("再起動申請を受け付けました。結果は画面とメールで通知します。"); } catch (e) { setError(e instanceof Error ? e.message : "申請に失敗しました。"); }
+    if (form.get("confirm") !== "tk_sdn_collator") { setError(message("restart.error.confirm")); return; }
+    if (demo) { onDone(message("restart.preview")); return; }
+    try { await api("/actions/restart", { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ password: form.get("password"), totp_code: form.get("totp"), reason: form.get("reason"), confirm: form.get("confirm") }) }); onDone(message("restart.accepted")); } catch (e) { setError(e instanceof Error && e.message ? e.message : message("restart.error.generic")); }
   }
-  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="restart-title"><button className="modal-close" onClick={onClose}>×</button><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="restart-title">astar.service を再起動</h2><p>操作はキューへ登録され、ホスト側の安全条件を通過した場合に1回だけ実行されます。</p><form onSubmit={submit}><label>理由<textarea name="reason" minLength={10} required placeholder="再起動が必要な根拠を入力" /></label><label>パスワード<input name="password" type="password" required /></label><label>6桁の認証コード<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>確認のためノード名を入力<input name="confirm" placeholder="tk_sdn_collator" required /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>キャンセル</button><button type="submit" className="primary-button danger-fill">申請する</button></div></form></section></div>;
+  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="restart-title"><button className="modal-close" aria-label={t("common.close")} onClick={onClose}>×</button><LanguageToggle className="modal-language-toggle" /><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="restart-title">{t("restart.title")}</h2><p>{t("restart.description")}</p><form onSubmit={submit}><label>{t("restart.reason")}<textarea name="reason" minLength={10} required placeholder={t("restart.reasonPlaceholder")} /></label><label>{t("common.password")}<input name="password" type="password" required /></label><label>{t("common.authCode")}<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>{t("restart.confirmLabel")}<input name="confirm" placeholder="tk_sdn_collator" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>{t("common.cancel")}</button><button type="submit" className="primary-button danger-fill">{t("restart.submit")}</button></div></form></section></div>;
 }
 
 function MetricCard({ label, value, sub, accent }: { label: string; value: string; sub: string; accent: string }) { return <article className={`metric-card ${accent}`}><span>{label}</span><strong>{value}</strong><small>{sub}</small></article>; }
@@ -548,11 +675,8 @@ function nearestPoint(points: TimePoint[], timestamp: number) {
   return points.reduce<TimePoint | undefined>((best, point) => !best || Math.abs(point.timestamp - timestamp) < Math.abs(best.timestamp - timestamp) ? point : best, undefined);
 }
 
-function formatChartTime(timestamp: number, includeDate = false) {
-  return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", ...(includeDate ? { month: "2-digit", day: "2-digit" } : {}), hour: "2-digit", minute: "2-digit" }).format(new Date(timestamp * 1000));
-}
-
-function TimeSeriesChart({ ariaLabel, series, thresholds = [], loading, error, yDomain, scale = "linear", formatValue, summaries = [] }: { ariaLabel: string; series: ChartSeries[]; thresholds?: ChartThreshold[]; loading: boolean; error: string; yDomain: [number, number]; scale?: "linear" | "symlog"; formatValue: (value: number) => string; summaries?: { label: string; value: string }[] }) {
+function TimeSeriesChart({ ariaLabel, series, thresholds = [], loading, error, yDomain, scale = "linear", formatValue, summaries = [] }: { ariaLabel: string; series: ChartSeries[]; thresholds?: ChartThreshold[]; loading: boolean; error?: MessageKey; yDomain: [number, number]; scale?: "linear" | "symlog"; formatValue: (value: number) => string; summaries?: { label: string; value: string }[] }) {
+  const { t, formatChartTime } = useI18n();
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   const allPoints = series.flatMap((item) => item.points);
   const primary = series.reduce<ChartSeries | undefined>((best, item) => !best || item.points.length > best.points.length ? item : best, undefined);
@@ -570,8 +694,8 @@ function TimeSeriesChart({ ariaLabel, series, thresholds = [], loading, error, y
   const includeDate = maxTime - minTime >= 86_400;
   const axisValues = [maxValue, inverseValue((transformedMax + transformedMin) / 2), minValue];
 
-  if (loading && !allPoints.length) return <div className="chart-state" role="status"><span className="chart-spinner" />履歴を読み込んでいます…</div>;
-  if (!allPoints.length) return <div className="chart-state chart-state-error" role="status"><strong>時系列データがありません</strong><span>{error || "次のPrometheus収集後に自動で表示します。"}</span></div>;
+  if (loading && !allPoints.length) return <div className="chart-state" role="status"><span className="chart-spinner" />{t("chart.loading")}</div>;
+  if (!allPoints.length) return <div className="chart-state chart-state-error" role="status"><strong>{t("chart.empty")}</strong><span>{error ? t(error) : t("chart.emptyText")}</span></div>;
 
   return <div className="time-series">
     <div className="chart-meta">
@@ -615,12 +739,12 @@ function TimeSeriesChart({ ariaLabel, series, thresholds = [], loading, error, y
       </div>
     </div>
     <div className="chart-x-axis" aria-hidden="true"><span>{formatChartTime(minTime, includeDate)}</span><span>{formatChartTime((minTime + maxTime) / 2, includeDate)}</span><span>{formatChartTime(maxTime, includeDate)}</span></div>
-    {primary?.points.length === 1 && <p className="chart-note">履歴を蓄積中です。次の収集後に線で表示します。</p>}
-    {error && <p className="chart-note chart-note-error">{error}</p>}
+    {primary?.points.length === 1 && <p className="chart-note">{t("chart.collecting")}</p>}
+    {error && <p className="chart-note chart-note-error">{t(error)}</p>}
     {summaries.length > 0 && <dl className="chart-summary">{summaries.map((item) => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl>}
   </div>;
 }
 
 function Gauge({ label, value, warn }: { label: string; value: number; warn: number }) { return <div className="gauge"><div><span>{label}</span><b>{value.toFixed(0)}%</b></div><div className="gauge-track"><i className={value >= warn ? "warn" : ""} style={{ width: `${value}%` }} /></div></div>; }
-function IncidentRow({ item }: { item: Incident }) { return <div className="incident-row"><b className={`severity ${item.severity}`}>{item.severity}</b><div><strong>{item.title}</strong><small>{item.diagnosis}</small></div><time>{fmtTime(item.opened_at)}</time></div>; }
+function IncidentRow({ item }: { item: Incident }) { const { t, formatDateTime, formatEnum } = useI18n(); return <div className="incident-row"><b className={`severity ${item.severity}`}>{formatEnum(item.severity)}</b><div><strong>{incidentTitle(item, t)}</strong><small>{item.diagnosis}</small></div><time>{formatDateTime(item.opened_at)}</time></div>; }
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><span>—</span><strong>{title}</strong><p>{text}</p></div>; }

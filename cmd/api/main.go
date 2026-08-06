@@ -31,9 +31,10 @@ type contextKey string
 const userKey contextKey = "user"
 
 type server struct {
-	cfg   config.Config
-	store *store.Store
-	agent *agentclient.Client
+	cfg          config.Config
+	store        *store.Store
+	agent        *agentclient.Client
+	publicStatus *publicStatusService
 }
 
 func main() {
@@ -58,9 +59,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.DB.Close()
-	s := &server{cfg: cfg, store: db, agent: agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock)}
+	s := &server{cfg: cfg, store: db, agent: agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), publicStatus: newPublicStatusService(db.LoadOverview)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.Handle("GET /api/v1/public/status", s.publicStatus.middleware(http.HandlerFunc(s.publicStatus.handle)))
 	mux.Handle("GET /api/v1/overview", s.requireAuth(http.HandlerFunc(s.overview)))
 	mux.Handle("GET /api/v1/metrics/{panel}", s.requireAuth(http.HandlerFunc(s.metrics)))
 	mux.Handle("GET /api/v1/logs", s.requireAuth(http.HandlerFunc(s.logs)))

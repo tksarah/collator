@@ -1,6 +1,6 @@
 # Shiden Guardian
 
-Shiden Guardianは、自宅で稼働するShiden Collatorノードを継続監視し、異常の証拠を集め、必要に応じて運用者へ通知する日本語Webダッシュボードです。対象は次の1台に固定されています。
+Shiden Guardianは、自宅で稼働するShiden Collatorノードを継続監視し、異常の証拠を集め、必要に応じて運用者へ通知する英語・日本語対応Webダッシュボードです。対象は次の1台に固定されています。
 
 - ノード名: `tk_sdn_collator`
 - systemd unit: `astar.service`
@@ -43,6 +43,7 @@ Composeは`caddy`、`api`、`auth-broker`、`controller`、`prometheus`、`postg
 
 ## 画面と主な機能
 
+- **ログイン前ステータス**: 認証情報を送らない専用APIから、総合稼働、Node、Sync、ローカルfinalized block、最終観測時刻だけを30秒ごとに表示します。
 - **概要**: service状態、uptime、バージョン、再起動回数、block、同期差、peer、ホスト資源、報酬の要点、直近インシデントを表示します。
 - **メトリクス**: CPU、メモリ、peer数、同期差、ローカル・外部block高を用途別の時系列グラフで表示します。画面表示中は15秒ごとに更新します。
 - **ログ**: `astar.service`のjournaldログを原文のまま検索・確認します。
@@ -51,7 +52,7 @@ Composeは`caddy`、`api`、`auth-broker`、`controller`、`prometheus`、`postg
 - **設定・監査**: observe-only状態、メール・Gemini接続テスト、認証・設定・操作の監査履歴を確認します。
 - **報酬**: active set、最終報酬、24時間報酬、残高、作成間隔、日別・累計報酬、block単位の検証証拠を表示します。
 
-元ログ以外のUI・通知・AI診断は日本語です。金額と時刻は読みやすく表示し、正確なPlanck値や原時刻も確認できます。
+Web UIは英語を初期表示とし、画面上の`EN / 日本語`トグルで即時に切り替えられます。選択はブラウザーへ保存され、数値表記は表示言語に従います。時刻は両言語とも`Asia/Tokyo`です。既知のインシデント名は表示言語へ変換しますが、journaldの生ログ、保存済みAI診断、未知のインシデント名は証拠の原文を維持します。通知メールと新規AI診断の生成言語は引き続き日本語です。
 
 ## ノード監視と既定しきい値
 
@@ -104,6 +105,8 @@ Geminiは安定版モデル`gemini-3.6-flash`を`store=false`、構造化出力�
 
 ## セキュリティ境界
 
+- 未認証の`GET /api/v1/public/status`は公開専用の固定6フィールドだけを返します。node名、peer数、同期差、ホスト資源、報酬、incident、ログ、automation、ユーザー・session情報は返さず、既存の管理APIは引き続き認証必須です。
+- 公開ステータスAPIはCaddyからの接続だけを受理し、IP単位・全体のtoken bucket、10秒キャッシュ、2秒DB timeoutで負荷を制限します。60秒を超えた監視データやDB障害は詳細を返さず`unavailable`へ倒します。
 - Web公開ポートはCaddyのTCP `80/443`とHTTP/3用UDP `443`です。ブロックチェーンP2P用TCP `30333/30334`もルーターで意図的に公開します。PostgreSQL、Prometheus、API、RPC、9615/9616 metricsは公開しません。
 - `80`はHTTPからHTTPSへの転送とACME証明書の発行・更新に使います。HTTP-01を使う現在の構成では、証明書取得後もルーター側で閉じないでください。
 - host agentの観測・制御は`/run/shiden-guardian/observe/agent.sock`と`/run/shiden-guardian/control/agent.sock`に分離します。
@@ -258,7 +261,7 @@ sudo sh /home/tk/shiden-guardian/releases/<VERSION>/scripts/activate-release.sh 
   /home/tk/shiden-guardian <VERSION>
 ```
 
-Activationは設定確認、DBとroleのbackup、migration dry-run、role別の許可・拒否検証を行い、検証成功後にDB管理passwordをローテーションしてからComposeを起動します。passwordローテーション前の失敗だけ直前releaseへ自動rollbackします。ローテーション後は旧管理credentialを再公開せずfix-forwardし、旧releaseへの自動rollbackは行いません。`astar.service`をActivationの都合で再起動することはありません。
+Activationは設定確認、DBとroleのbackup、migration dry-run、role別の許可・拒否検証を行い、検証成功後にDB管理passwordをローテーションします。その後、PostgreSQL containerと永続volumeは維持し、API、auth-broker、controller、backup、Prometheus、Caddyを新releaseから強制再作成します。これにより、image差分がないserviceも旧release directoryのsecret mountを保持しません。passwordローテーション前の失敗だけ直前releaseへ自動rollbackします。ローテーション後は旧管理credentialを再公開せずfix-forwardし、旧releaseへの自動rollbackは行いません。`astar.service`をActivationの都合で再起動することはありません。
 
 DB schema・credential・Compose定義を変更しないcontroller-only更新では、次の専用経路を使います。
 
@@ -323,6 +326,8 @@ routerのTCP 80/443 forwarding、domainのDNS、Caddy log、外向き通信を�
 ### migrationでDB password authentication failedになる
 
 新releaseへ古い`.env`だけをコピーせず、必ず`migrate-release-config.sh /home/tk/shiden-guardian/current`を使って`.env`と対応するsecretsを一緒に移行します。値そのものは画面へ表示されません。
+
+Activationが`database credential rotation`後の失敗を報告した場合は、旧releaseへのrollbackや`migrate-release-config.sh`の再実行を行いません。DB側のcredentialはすでに新releaseへ更新済みです。新release directoryを維持し、`docker compose ps`とAPI、auth-broker、controllerのlogを確認してfix-forwardします。
 
 ### メールが届かない
 

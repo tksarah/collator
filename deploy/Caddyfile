@@ -39,6 +39,12 @@
 			header_up X-Real-IP {remote_host}
 		}
 	}
+	@public_status path /api/v1/public/status
+	handle @public_status {
+		reverse_proxy api:8080 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
 	handle /api/* {
 		reverse_proxy api:8080
 	}
