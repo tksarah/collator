@@ -44,7 +44,7 @@ Composeは`caddy`、`api`、`auth-broker`、`controller`、`prometheus`、`postg
 ## 画面と主な機能
 
 - **ログイン前ステータス**: 認証情報を送らない専用APIから、総合稼働、Node、Sync、ローカルfinalized block、最終観測時刻だけを30秒ごとに表示します。
-- **概要**: service状態、uptime、バージョン、再起動回数、block、同期差、peer、ホスト資源、報酬の要点、直近インシデントを表示します。
+- **概要**: service状態、uptime、コレーターバイナリの完全なバージョン文字列、再起動回数、block、同期差、peer、ホスト資源、報酬の要点、直近インシデントを表示します。
 - **メトリクス**: CPU、メモリ、peer数、同期差、ローカル・外部block高を用途別の時系列グラフで表示します。画面表示中は15秒ごとに更新します。
 - **ログ**: `astar.service`のjournaldログを原文のまま検索・確認します。
 - **インシデント**: ルール検知、Gemini診断、復旧・解決状態と証拠を確認します。
@@ -53,6 +53,8 @@ Composeは`caddy`、`api`、`auth-broker`、`controller`、`prometheus`、`postg
 - **報酬**: active set、最終報酬、24時間報酬、残高、作成間隔、日別・累計報酬、block単位の検証証拠を表示します。
 
 Web UIは英語を初期表示とし、画面上の`EN / 日本語`トグルで即時に切り替えられます。選択はブラウザーへ保存され、数値表記は表示言語に従います。時刻は両言語とも`Asia/Tokyo`です。既知のインシデント名は表示言語へ変換しますが、journaldの生ログ、保存済みAI診断、未知のインシデント名は証拠の原文を維持します。通知メールと新規AI診断の生成言語は引き続き日本語です。
+
+概要ページのカードは、デスクトップでは「ブロック進行／ホスト余力」「報酬・ブロック生成／復旧ガード」「直近のインシデント（全幅）」の3段で表示し、1100px以下では同じ意味順の1列表示へ切り替わります。上部ステータスカードのPC画像は装飾要素としてカード内に全体表示し、FINALIZED BLOCKや説明文と重ならないよう画面幅に応じて縮小・減光します。620px以下では画像を非表示にします。コレーターバイナリのバージョンは既存の`Overview.node.version`をそのまま表示し、長い文字列はカード内で折り返します。
 
 ## ノード監視と既定しきい値
 
@@ -220,6 +222,12 @@ bash scripts/deploy-wsl.sh
 ```
 
 処理順は、読み取り専用preflight、Compose構文確認、linux/amd64 build、agent build、Web build、archive SHA-256生成、SSH転送、リモートSHA-256検証、展開、リモートpreflightです。成功した時だけ、新releaseの手動コマンドを表示します。
+
+このコマンドが行うのは新releaseのstageまでです。設定・secretsの移行、host agentの更新、`current`の切替、稼働中serviceの再作成は行いません。stage後も、運用者が後述のActivationを実行するまでは既存releaseが稼働します。稼働中releaseは次で確認します。
+
+```sh
+readlink -f /home/tk/shiden-guardian/current
+```
 
 ローカルの`release/`は、リモートstageが完全に成功した後だけ厳密な名前の旧成果物を削除し、最新1世代を保持します。stage失敗時は直前の最新版を残します。無関係なファイルと、リモートの`/home/tk/shiden-guardian/releases/`は自動削除しません。
 

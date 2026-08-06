@@ -8,6 +8,7 @@ test("静的ダッシュボードを生成する", async () => {
   assert.match(html, /tk_sdn_collator/);
   assert.match(html, /lang="en"/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
+  await access(new URL("../out/beelink-mini-s.png", import.meta.url));
 });
 
 test("スターターの一時プレビューを残さない", async () => {
@@ -29,4 +30,9 @@ test("日英UI、言語保存、公開ステータス、報酬監視画面を静
   assert.match(compiled, /\/api\/v1\/public\/status/);
   assert.match(compiled, /sg_locale/);
   assert.match(compiled, /WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN/);
+  assert.match(compiled, /Collator binary/);
+  assert.match(compiled, /コレーターバイナリ/);
+  assert.match(compiled, /beelink-mini-s\.png/);
+  assert.doesNotMatch(compiled, /All administrative actions are audited/);
+  assert.doesNotMatch(compiled, /管理操作はすべて記録され/);
 });

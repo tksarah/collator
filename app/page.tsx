@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { I18nProvider, LanguageToggle, LocalizedMessage, MessageKey, MessageValues, useI18n } from "./i18n";
 
@@ -344,7 +345,7 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
   }
   if (needsBootstrap === null) return <main className="login-shell"><section className="login-card"><div className="brand-orbit large"><span /></div><p>{t("loading.connecting")}</p></section></main>;
   if (needsBootstrap) return <Bootstrap onDone={() => setNeedsBootstrap(false)} />;
-  return <main className="login-page"><LanguageToggle className="login-language-toggle" /><div className="login-layout"><section className="login-panel" aria-labelledby="login-title"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">{t("auth.eyebrow")}</p><h1 id="login-title">{t("auth.title")}</h1><p className="muted">{t("auth.description")}</p><form onSubmit={submit}><label>{t("auth.username")}<input name="username" autoComplete="username" required /></label><label>{t("auth.password")}<input type="password" name="password" autoComplete="current-password" required /></label><label>{t("auth.code")}<input name="totp" autoComplete="one-time-code" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<button className="primary-button" type="submit">{t("auth.submit")}</button></form></section><PublicStatusCard /></div></main>;
+  return <main className="login-page"><LanguageToggle className="login-language-toggle" /><div className="login-layout"><section className="login-panel" aria-labelledby="login-title"><div className="brand login-brand"><div className="brand-orbit"><span /></div><div><strong>SHIDEN</strong><small>GUARDIAN</small></div></div><p className="eyebrow">{t("auth.eyebrow")}</p><h1 id="login-title">{t("auth.title")}</h1><form onSubmit={submit}><label>{t("auth.username")}<input name="username" autoComplete="username" required /></label><label>{t("auth.password")}<input type="password" name="password" autoComplete="current-password" required /></label><label>{t("auth.code")}<input name="totp" autoComplete="one-time-code" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<button className="primary-button" type="submit">{t("auth.submit")}</button></form></section><PublicStatusCard /></div></main>;
 }
 
 function PublicStatusCard() {
@@ -421,6 +422,7 @@ function Bootstrap({ onDone }: { onDone: () => void }) {
 function OverviewTab({ data, demo, onRestart }: { data: Overview; demo: boolean; onRestart: () => void }) {
   const { t, formatNumber, formatDuration, formatUptime, formatPlanck, formatEnum, formatItemCount } = useI18n();
   const healthy = data.node.service_state === "active" && data.chain.status === "healthy";
+  const collatorVersion = data.node.version.trim() || "—";
   const demoBlocks = useMemo<LoadedSeries[]>(() => {
     const external = chartValues.map((_, index) => 9_842_610 + index * 4);
     const local = external.map((value, index) => value - (index % 7 === 0 ? 3 : index % 5 === 0 ? 1 : 0));
@@ -442,11 +444,12 @@ function OverviewTab({ data, demo, onRestart }: { data: Overview; demo: boolean;
   return <div className="page-content">
     <section className="hero-status">
       <div className="hero-copy"><span className={healthy ? "status-pill healthy" : "status-pill critical"}><i />{healthy ? t("overview.healthyBadge") : t("overview.attentionBadge")}</span><h2>{healthy ? t("overview.healthyTitle") : t("overview.attentionTitle")}</h2><p>{t("overview.heroText")}</p></div>
+      <div className="hero-hardware" aria-hidden="true"><Image src="/beelink-mini-s.png" alt="" width={1411} height={1115} /></div>
       <div className="block-readout"><span>FINALIZED BLOCK</span><strong>{formatNumber(data.chain.local_finalized)}</strong><small>{t("overview.externalDifference", { count: data.chain.lag })}</small></div>
     </section>
 
     <div className="metric-grid">
-      <MetricCard label="SERVICE" value={formatEnum(data.node.service_state).toUpperCase()} sub={t("overview.serviceUptime", { duration: formatUptime(data.node.uptime_seconds) })} accent="green" />
+      <MetricCard label="SERVICE" value={formatEnum(data.node.service_state).toUpperCase()} sub={t("overview.serviceUptime", { duration: formatUptime(data.node.uptime_seconds) })} detail={t("overview.collatorBinary", { version: collatorVersion })} accent="green" />
       <MetricCard label="PEERS" value={String(data.chain.peers)} sub={t("overview.peerThreshold")} accent="violet" />
       <MetricCard label="CPU" value={`${data.host.cpu_percent.toFixed(0)}%`} sub={t("overview.temperature", { value: data.host.temperature_c.toFixed(0) })} accent="blue" />
       <MetricCard label="MEMORY" value={`${data.host.memory_percent.toFixed(0)}%`} sub={t("overview.memoryNormal")} accent="amber" />
@@ -456,8 +459,8 @@ function OverviewTab({ data, demo, onRestart }: { data: Overview; demo: boolean;
       <section className="panel chain-panel"><PanelTitle overline="CHAIN PROGRESS" title={t("overview.chainProgress")} action={t("overview.last30m")} /><TimeSeriesChart ariaLabel={t("overview.chainChart")} series={blockSeries} loading={blocks.loading} error={blocks.error} yDomain={[Math.max(0, blockMin - blockPadding), blockMax + blockPadding]} formatValue={(value) => formatNumber(Math.round(value))} /><div className="chain-stats"><div><span>LOCAL BEST</span><strong>{formatNumber(data.chain.local_best)}</strong></div><div><span>EXTERNAL</span><strong>{formatNumber(data.chain.external_height)}</strong></div><div><span>SYNC LAG</span><strong>{data.chain.lag} blocks</strong></div></div></section>
       <section className="panel health-panel"><PanelTitle overline="HOST HEALTH" title={t("overview.hostCapacity")} /><Gauge label={t("overview.memory")} value={data.host.memory_percent} warn={90} /><Gauge label={t("overview.disk")} value={data.host.disk_percent} warn={85} /><Gauge label="CPU" value={data.host.cpu_percent} warn={90} /><div className="health-note"><span className="tiny-dot" /> {t("overview.resourceHealthy")}</div></section>
       <section className="panel reward-overview-panel"><PanelTitle overline="COLLATOR REWARDS" title={t("overview.rewardsTitle")} action={formatEnum(data.rewards.status).toUpperCase()} /><div className="reward-status-line"><span className={`reward-health ${data.rewards.status}`}><i />{data.rewards.active_session ? t("overview.activeSet") : t("overview.notActive")}</span><span>{t("overview.evidenceQuorum", { count: data.rewards.quorum })}</span></div><dl className="reward-overview-stats"><div><dt>{t("overview.lastReward")}</dt><dd>{data.rewards.last_reward_at ? t("overview.ago", { duration: formatDuration(data.rewards.seconds_since_reward) }) : t("common.collecting")}</dd></div><div><dt>{t("overview.last24h")}</dt><dd>{formatPlanck(data.rewards.reward_24h_planck)}</dd><small>{formatNumber(data.rewards.reward_24h_count)} blocks</small></div><div><dt>{t("overview.walletBalance")}</dt><dd>{formatPlanck(data.rewards.wallet_free_planck)}</dd></div></dl><p className="panel-note">{t("overview.rewardPolicy")}</p></section>
-      <section className="panel incident-panel"><PanelTitle overline="LATEST SIGNAL" title={t("overview.latestIncident")} action={formatItemCount(data.incidents.length)} />{data.incidents.length ? data.incidents.slice(0, 2).map((item) => <IncidentRow key={item.id} item={item} />) : <Empty title={t("overview.noIncidents")} text={t("overview.noIncidentsText")} />}</section>
       <section className="panel automation-panel"><PanelTitle overline="REMEDIATION" title={t("overview.remediationGuard")} /><div className="guard-state"><span className="guard-icon">G</span><div><strong>{data.automation.host_locked ? t("overview.guardLocked") : data.automation.enabled ? t("overview.guardEnabled") : t("overview.guardObserve")}</strong><p>{data.automation.host_locked ? t("overview.guardLockedText") : data.automation.enabled ? t("overview.guardEnabledText") : t("overview.guardObserveText")}</p></div></div><ul className="guard-list"><li><span>AI confidence</span><b>{t("overview.minimumConfidence")}</b></li><li><span>Cooldown</span><b>{t("overview.cooldown")}</b></li><li><span>{t("overview.limitLabel")}</span><b>{t("overview.limit")}</b></li></ul><button className="outline-button danger" onClick={onRestart}>{t("overview.openRestart")}</button></section>
+      <section className="panel incident-panel"><PanelTitle overline="LATEST SIGNAL" title={t("overview.latestIncident")} action={formatItemCount(data.incidents.length)} />{data.incidents.length ? data.incidents.slice(0, 2).map((item) => <IncidentRow key={item.id} item={item} />) : <Empty title={t("overview.noIncidents")} text={t("overview.noIncidentsText")} />}</section>
     </div>
   </div>;
 }
@@ -658,7 +661,7 @@ function RestartDialog({ demo, onClose, onDone }: { demo: boolean; onClose: () =
   return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="restart-title"><button className="modal-close" aria-label={t("common.close")} onClick={onClose}>×</button><LanguageToggle className="modal-language-toggle" /><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="restart-title">{t("restart.title")}</h2><p>{t("restart.description")}</p><form onSubmit={submit}><label>{t("restart.reason")}<textarea name="reason" minLength={10} required placeholder={t("restart.reasonPlaceholder")} /></label><label>{t("common.password")}<input name="password" type="password" required /></label><label>{t("common.authCode")}<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>{t("restart.confirmLabel")}<input name="confirm" placeholder="tk_sdn_collator" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>{t("common.cancel")}</button><button type="submit" className="primary-button danger-fill">{t("restart.submit")}</button></div></form></section></div>;
 }
 
-function MetricCard({ label, value, sub, accent }: { label: string; value: string; sub: string; accent: string }) { return <article className={`metric-card ${accent}`}><span>{label}</span><strong>{value}</strong><small>{sub}</small></article>; }
+function MetricCard({ label, value, sub, detail, accent }: { label: string; value: string; sub: string; detail?: string; accent: string }) { return <article className={`metric-card ${accent}`}><span>{label}</span><strong>{value}</strong><small>{sub}</small>{detail && <small className="metric-detail" title={detail}>{detail}</small>}</article>; }
 function PanelTitle({ overline, title, action }: { overline: string; title: string; action?: string }) { return <header className="panel-title"><div><span>{overline}</span><h3>{title}</h3></div>{action && <b>{action}</b>}</header>; }
 
 function chartPath(points: TimePoint[], minTime: number, maxTime: number, valueToY: (value: number) => number, curve: "linear" | "step" = "linear") {

@@ -252,7 +252,10 @@ nav { display: grid; gap: 6px; }
 }
 
 .hero-status::after { content: ""; position: absolute; right: 24%; top: -40px; width: 200px; height: 200px; border: 1px solid rgba(139, 108, 240, 0.08); border-radius: 50%; box-shadow: 0 0 0 30px rgba(139, 108, 240, 0.03), 0 0 0 65px rgba(139, 108, 240, 0.02); }
-.hero-copy { position: relative; z-index: 1; max-width: 720px; }
+.hero-copy { position: relative; z-index: 1; max-width: min(720px, 53%); }
+.hero-hardware { position: absolute; z-index: 0; top: 50%; right: max(244px, 23%); width: auto; height: calc(100% - 24px); aspect-ratio: 1411 / 1115; opacity: .46; filter: saturate(.78) brightness(.74) contrast(1.08) drop-shadow(0 24px 34px rgba(0, 0, 0, .52)); pointer-events: none; transform: translateY(-50%) rotate(-1.5deg); }
+.hero-hardware::before { content: ""; position: absolute; inset: 18% 12%; border-radius: 50%; background: rgba(111, 84, 202, .18); filter: blur(32px); }
+.hero-hardware img { position: relative; display: block; width: 100%; height: 100%; object-fit: contain; }
 .status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 11px; border-radius: 6px; font: 700 var(--font-label) ui-monospace, monospace; letter-spacing: 0.09em; }
 .status-pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
 .status-pill.healthy { color: var(--green); background: rgba(52, 166, 119, 0.1); border: 1px solid rgba(67, 207, 146, 0.32); }
@@ -270,13 +273,19 @@ nav { display: grid; gap: 6px; }
 .metric-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: currentColor; }
 .metric-card > span { color: #9aa7b6; font: 700 var(--font-label) ui-monospace, monospace; letter-spacing: 0.11em; }
 .metric-card strong { display: block; margin: 9px 0 5px; color: var(--text); font: 500 28px ui-monospace, monospace; }
-.metric-card small { color: var(--muted); font-size: var(--font-support); }
+.metric-card small { display: block; color: var(--muted); font-size: var(--font-support); }
+.metric-card .metric-detail { margin-top: 5px; color: var(--muted-strong); overflow-wrap: anywhere; }
 .metric-card.green { color: var(--green); }
 .metric-card.violet { color: var(--violet); }
 .metric-card.blue { color: var(--blue); }
 .metric-card.amber { color: var(--amber); }
 
-.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(340px, 1fr); gap: 17px; align-items: start; }
+.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(340px, 1fr); grid-template-areas: "chain health" "reward automation" "incident incident"; gap: 17px; align-items: stretch; }
+.chain-panel { grid-area: chain; }
+.health-panel { grid-area: health; }
+.reward-overview-panel { grid-area: reward; }
+.automation-panel { grid-area: automation; }
+.incident-panel { grid-area: incident; }
 .panel { min-width: 0; padding: 26px; border: 1px solid var(--line); border-radius: 11px; background: linear-gradient(145deg, rgba(17, 23, 33, 0.98), rgba(12, 16, 23, 0.98)); }
 .panel-title { margin-bottom: 24px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .panel-title span { color: #909dad; font: 700 var(--font-label) ui-monospace, monospace; letter-spacing: 0.12em; }
@@ -556,6 +565,8 @@ nav { display: grid; gap: 6px; }
 @media (max-width: 1280px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .block-readout { display: none; }
+  .hero-copy { max-width: 66%; }
+  .hero-hardware { right: 18px; height: calc(100% - 28px); opacity: .34; }
   .reward-card-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .table-head,
   .table-row { grid-template-columns: 100px minmax(220px, 1fr) 100px; }
@@ -568,6 +579,7 @@ nav { display: grid; gap: 6px; }
   .metrics-layout,
   .maintenance-grid,
   .settings-grid { grid-template-columns: 1fr; }
+  .dashboard-grid { grid-template-areas: "chain" "health" "reward" "automation" "incident"; }
   .audit-panel { max-height: none; }
 }
 
@@ -603,6 +615,8 @@ nav { display: grid; gap: 6px; }
   .page-content { padding: 20px 14px 38px; }
   .notice { margin: 12px 14px 0; }
   .hero-status { padding: 26px 22px; }
+  .hero-copy { max-width: none; }
+  .hero-hardware { display: none; }
   .hero-copy h2 { font-size: 26px; }
   .metric-grid { grid-template-columns: 1fr; }
   .reward-card-grid { grid-template-columns: 1fr; }
