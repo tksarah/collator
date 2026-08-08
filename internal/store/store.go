@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -15,7 +16,10 @@ import (
 
 type Store struct{ DB *sql.DB }
 
-const RewardGapRetainedWindowBlocks int64 = 64
+const (
+	RewardGapRetainedWindowBlocks int64 = 64
+	RewardScanMaxTransitionBlocks int64 = 128
+)
 
 var (
 	ErrRewardCursorConflict    = errors.New("reward cursor conflict")
@@ -76,6 +80,8 @@ func MigrationStatements() []string {
 		`CREATE UNIQUE INDEX IF NOT EXISTS incidents_open_fingerprint_idx ON incidents(fingerprint) WHERE status='open'`,
 		`CREATE TABLE IF NOT EXISTS diagnoses (id text PRIMARY KEY, incident_id text REFERENCES incidents(id) ON DELETE CASCADE, payload jsonb NOT NULL, model text NOT NULL, prompt_version text NOT NULL, created_at timestamptz NOT NULL DEFAULT now())`,
 		`CREATE TABLE IF NOT EXISTS remediation_actions (id text PRIMARY KEY, idempotency_key text UNIQUE NOT NULL, incident_id text, requested_by text NOT NULL, reason text NOT NULL, mode text NOT NULL, status text NOT NULL DEFAULT 'pending', result jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now(), started_at timestamptz, finished_at timestamptz)`,
+		`ALTER TABLE remediation_actions ADD COLUMN IF NOT EXISTS action_kind text NOT NULL DEFAULT 'restart_service'`,
+		`ALTER TABLE remediation_actions ADD COLUMN IF NOT EXISTS parameters jsonb NOT NULL DEFAULT '{}'`,
 		`CREATE INDEX IF NOT EXISTS remediation_pending_idx ON remediation_actions(status, created_at)`,
 		`CREATE TABLE IF NOT EXISTS settings (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`,
 		`CREATE TABLE IF NOT EXISTS audit_events (id text PRIMARY KEY, action text NOT NULL, actor text NOT NULL, result text NOT NULL, details jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now())`,
@@ -263,19 +269,31 @@ type RewardGapRebase struct {
 	SnapshotFinalizedBlock int64  `json:"snapshot_finalized_block"`
 }
 
+type RewardGapApproval struct {
+	Actor    string
+	Reason   string
+	ActionID string
+}
+
 // AcknowledgePrunedRewardGap is an operator-approved recovery for history that
 // the authoritative local node has already discarded. It never creates reward
 // events: the skipped interval remains explicitly recorded in the durable
 // overview and audit log, while future retained blocks can be scanned normally.
-func (s *Store) AcknowledgePrunedRewardGap(ctx context.Context, expectedCursor, baseline, finalized int64) (RewardGapRebase, error) {
+func (s *Store) AcknowledgePrunedRewardGap(ctx context.Context, expectedCursor, baseline, finalized int64, approval RewardGapApproval) (RewardGapRebase, error) {
 	result := RewardGapRebase{
 		FromBlock:              expectedCursor + 1,
 		ThroughBlock:           baseline,
 		ResumeFromBlock:        baseline + 1,
 		SnapshotFinalizedBlock: finalized,
 	}
+	approval.Actor = strings.TrimSpace(approval.Actor)
+	approval.Reason = strings.TrimSpace(approval.Reason)
+	approval.ActionID = strings.TrimSpace(approval.ActionID)
 	if expectedCursor <= 0 || baseline <= expectedCursor || finalized-baseline != RewardGapRetainedWindowBlocks {
 		return RewardGapRebase{}, fmt.Errorf("invalid pruned reward gap rebase %d -> %d at finalized %d", expectedCursor, baseline, finalized)
+	}
+	if approval.Actor == "" || approval.Reason == "" {
+		return RewardGapRebase{}, fmt.Errorf("reward gap approval actor and reason are required")
 	}
 	auditID, err := NewID("aud")
 	if err != nil {
@@ -305,6 +323,15 @@ func (s *Store) AcknowledgePrunedRewardGap(ctx context.Context, expectedCursor, 
 	overview.LastScannedBlock = baseline
 	overview.FinalizedBlock = finalized
 	overview.Gap = fmt.Sprintf("acknowledged pruned history blocks %d-%d; retained scan pending from %d", result.FromBlock, result.ThroughBlock, result.ResumeFromBlock)
+	overview.Recovery = nil
+	overview.LastHistoryGap = &model.RewardHistoryGap{
+		FromBlock:        result.FromBlock,
+		ThroughBlock:     result.ThroughBlock,
+		ResumeFromBlock:  result.ResumeFromBlock,
+		AcknowledgedAt:   time.Now().UTC(),
+		AcknowledgedBy:   approval.Actor,
+		HistoryRecovered: false,
+	}
 	overview.Sources["historical_gap"] = fmt.Sprintf("acknowledged_pruned_blocks_%d_%d", result.FromBlock, result.ThroughBlock)
 	details := map[string]any{
 		"authority":                "local_finalized_rpc",
@@ -315,8 +342,12 @@ func (s *Store) AcknowledgePrunedRewardGap(ctx context.Context, expectedCursor, 
 		"retained_window_blocks":   RewardGapRetainedWindowBlocks,
 		"snapshot_finalized_block": result.SnapshotFinalizedBlock,
 		"through_block":            result.ThroughBlock,
+		"operator_reason":          approval.Reason,
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_events(id,action,actor,result,details) VALUES($1,'reward.history_gap.acknowledge','operator-approved-controller-recovery','acknowledged',$2)`, auditID, JSON(details)); err != nil {
+	if approval.ActionID != "" {
+		details["action_id"] = approval.ActionID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_events(id,action,actor,result,details) VALUES($1,'reward.history_gap.acknowledge',$2,'acknowledged',$3)`, auditID, approval.Actor, JSON(details)); err != nil {
 		return RewardGapRebase{}, err
 	}
 	update, err := tx.ExecContext(ctx, `UPDATE reward_monitor_state SET last_scanned_block=$1,payload=$2,updated_at=now() WHERE id=1 AND last_scanned_block=$3`, baseline, JSON(overview), expectedCursor)
@@ -358,11 +389,8 @@ func upsertRewardObservation(ctx context.Context, execer rewardObservationExecer
 // expected cursor check prevents a stale or duplicate controller from moving
 // the monitor state past data it did not observe.
 func (s *Store) ApplyRewardScan(ctx context.Context, expectedCursor int64, overview model.RewardOverview, observations []model.RewardObservation) error {
-	if expectedCursor <= 0 || overview.LastScannedBlock <= expectedCursor {
-		return fmt.Errorf("invalid reward cursor transition %d -> %d", expectedCursor, overview.LastScannedBlock)
-	}
-	if overview.LastScannedBlock-expectedCursor > 16 {
-		return fmt.Errorf("reward cursor transition exceeds 16 blocks: %d -> %d", expectedCursor, overview.LastScannedBlock)
+	if err := validateRewardCursorTransition(expectedCursor, overview.LastScannedBlock); err != nil {
+		return err
 	}
 	for _, observation := range observations {
 		if observation.BlockNumber <= expectedCursor || observation.BlockNumber > overview.LastScannedBlock {
@@ -394,6 +422,16 @@ func (s *Store) ApplyRewardScan(ctx context.Context, expectedCursor int64, overv
 		return fmt.Errorf("reward cursor update affected %d rows: %w", affected, affectedErr)
 	}
 	return tx.Commit()
+}
+
+func validateRewardCursorTransition(expectedCursor, nextCursor int64) error {
+	if expectedCursor <= 0 || nextCursor <= expectedCursor {
+		return fmt.Errorf("invalid reward cursor transition %d -> %d", expectedCursor, nextCursor)
+	}
+	if nextCursor-expectedCursor > RewardScanMaxTransitionBlocks {
+		return fmt.Errorf("reward cursor transition exceeds %d blocks: %d -> %d", RewardScanMaxTransitionBlocks, expectedCursor, nextCursor)
+	}
+	return nil
 }
 
 func (s *Store) RewardPage(ctx context.Context, limit int, before int64) ([]model.RewardObservation, error) {

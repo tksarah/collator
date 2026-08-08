@@ -151,6 +151,11 @@ try {
 	$wrongTOTPBody.totp_code = "000000"
 	$wrongTOTP = Request-Json "POST" "/api/v1/actions/restart" $wrongTOTPBody @("-b", $cookies, "-H", "X-CSRF-Token: $csrf", "-H", "Idempotency-Key: e2e-wrong-totp")
 	if ($wrongTOTP.Status -ne 403) { throw "Restart with a wrong TOTP returned $($wrongTOTP.Status)" }
+	$rewardGapBody = @{ password="E2e!GuardianPassword2026"; totp_code="000000"; reason="E2E pruned reward gap boundary verification"; confirm="PRUNED GAP 12345"; expected_cursor=12345 }
+	$rewardGapMissingCSRF = Request-Json "POST" "/api/v1/actions/reward-gap/acknowledge" $rewardGapBody @("-b", $cookies, "-H", "Idempotency-Key: e2e-gap-missing-csrf")
+	if ($rewardGapMissingCSRF.Status -ne 403) { throw "Reward gap acknowledgement without CSRF returned $($rewardGapMissingCSRF.Status)" }
+	$rewardGapWrongTOTP = Request-Json "POST" "/api/v1/actions/reward-gap/acknowledge" $rewardGapBody @("-b", $cookies, "-H", "X-CSRF-Token: $csrf", "-H", "Idempotency-Key: e2e-gap-wrong-totp")
+	if ($rewardGapWrongTOTP.Status -ne 403) { throw "Reward gap acknowledgement with a wrong TOTP returned $($rewardGapWrongTOTP.Status)" }
 	if ((Get-ActionCount) -ne "0") { throw "A failed CSRF/password/TOTP check reached the action socket" }
 
 	& docker @compose --profile tools run --rm --no-deps --build action-probe

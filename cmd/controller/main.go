@@ -62,11 +62,13 @@ type controller struct {
 	rewardWriter        rewardHistoryWriter
 	rewardScanNext      time.Time
 	rewardScanFailures  int
+	rewardMu            sync.Mutex
 }
 
 const (
-	rewardScanChunkSize = int64(16)
-	rewardScanInterval  = 15 * time.Second
+	rewardScanChunkSize    = int64(16)
+	rewardScanMaxChunkSize = store.RewardScanMaxTransitionBlocks
+	rewardScanInterval     = 15 * time.Second
 )
 
 type rewardHistoryScanner interface {
@@ -83,7 +85,7 @@ type rewardGapAuthority interface {
 }
 
 type rewardGapWriter interface {
-	AcknowledgePrunedRewardGap(context.Context, int64, int64, int64) (store.RewardGapRebase, error)
+	AcknowledgePrunedRewardGap(context.Context, int64, int64, int64, store.RewardGapApproval) (store.RewardGapRebase, error)
 }
 
 func main() {
@@ -162,14 +164,14 @@ func runPrunedRewardGapAcknowledgement(args []string) error {
 		return err
 	}
 	defer db.DB.Close()
-	result, err := acknowledgePrunedRewardGap(ctx, agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), db, expectedCursor)
+	result, err := acknowledgePrunedRewardGap(ctx, agentclient.New(cfg.AgentObserveSock, cfg.AgentControlSock), db, expectedCursor, store.RewardGapApproval{Actor: "operator-approved-cli", Reason: "operator approved local state pruning recovery"})
 	if err != nil {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
 }
 
-func acknowledgePrunedRewardGap(ctx context.Context, authority rewardGapAuthority, writer rewardGapWriter, expectedCursor int64) (store.RewardGapRebase, error) {
+func acknowledgePrunedRewardGap(ctx context.Context, authority rewardGapAuthority, writer rewardGapWriter, expectedCursor int64, approval store.RewardGapApproval) (store.RewardGapRebase, error) {
 	if expectedCursor <= 0 {
 		return store.RewardGapRebase{}, fmt.Errorf("invalid expected reward cursor")
 	}
@@ -186,7 +188,7 @@ func acknowledgePrunedRewardGap(ctx context.Context, authority rewardGapAuthorit
 	discardedTo := min(expectedCursor+rewardScanChunkSize, snapshot.FinalizedBlock)
 	if _, discardedErr := authority.RewardScan(ctx, expectedCursor+1, discardedTo); discardedErr == nil {
 		return store.RewardGapRebase{}, fmt.Errorf("reward history is readable; acknowledgement is not permitted")
-	} else if !strings.Contains(strings.ToLower(discardedErr.Error()), "state already discarded") {
+	} else if !isPrunedRewardStateError(discardedErr) {
 		return store.RewardGapRebase{}, fmt.Errorf("reward history failed for a reason other than local state pruning: %w", discardedErr)
 	}
 	baseline := snapshot.FinalizedBlock - store.RewardGapRetainedWindowBlocks
@@ -199,7 +201,23 @@ func acknowledgePrunedRewardGap(ctx context.Context, authority rewardGapAuthorit
 	if err := validateLocalRewardScan(probe, probeFrom, probeTo); err != nil {
 		return store.RewardGapRebase{}, fmt.Errorf("retained local reward scan validation: %w", err)
 	}
-	return writer.AcknowledgePrunedRewardGap(ctx, expectedCursor, baseline, snapshot.FinalizedBlock)
+	return writer.AcknowledgePrunedRewardGap(ctx, expectedCursor, baseline, snapshot.FinalizedBlock, approval)
+}
+
+func isPrunedRewardStateError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "state already discarded")
+}
+
+func rewardRecoveryForScanError(cursor, finalized int64, err error) *model.RewardRecovery {
+	if !isPrunedRewardStateError(err) || cursor <= 0 || finalized-cursor <= store.RewardGapRetainedWindowBlocks {
+		return nil
+	}
+	return &model.RewardRecovery{
+		Required:                 true,
+		Reason:                   "local_state_pruned",
+		ExpectedCursor:           cursor,
+		CandidateResumeFromBlock: finalized - store.RewardGapRetainedWindowBlocks + 1,
+	}
 }
 
 func (c *controller) loop() {
@@ -305,6 +323,8 @@ func (c *controller) cleanupRetention(ctx context.Context) {
 }
 
 func (c *controller) collectRewards(ctx context.Context, state *model.Overview) []rules.Signal {
+	c.rewardMu.Lock()
+	defer c.rewardMu.Unlock()
 	now := time.Now().UTC()
 	for i := range c.external {
 		if c.externalOK[i] && c.external[i] > c.rewardChainHeight[i] {
@@ -331,6 +351,7 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 	if localErr != nil {
 		previous.Sources["local"] = "unavailable"
 		previous.Gap = localErr.Error()
+		previous.Recovery = nil
 	} else {
 		if local.SchemaOK {
 			previous.Sources["local"] = "ok"
@@ -395,15 +416,18 @@ func (c *controller) collectRewards(ctx context.Context, state *model.Overview) 
 		updated, attempted, scanErr := c.scanLocalRewardHistory(ctx, now, previous, local.FinalizedBlock)
 		if scanErr != nil {
 			cursor := previous.LastScannedBlock + 1
-			end := min(cursor+rewardScanChunkSize-1, local.FinalizedBlock)
+			end := rewardScanEnd(previous.LastScannedBlock, local.FinalizedBlock)
 			previous.Gap = fmt.Sprintf("blocks %d-%d: %v", cursor, end, scanErr)
+			previous.Recovery = rewardRecoveryForScanError(previous.LastScannedBlock, local.FinalizedBlock, scanErr)
 		} else if attempted {
 			previous = updated
 		}
 	} else if localErr == nil && local.FinalizedBlock < previous.LastScannedBlock {
 		previous.Gap = fmt.Sprintf("local finalized block %d is behind reward cursor %d", local.FinalizedBlock, previous.LastScannedBlock)
+		previous.Recovery = nil
 	} else if localErr == nil {
 		previous.Gap = ""
+		previous.Recovery = nil
 	}
 	if localErr == nil && previous.LastScannedBlock == 0 {
 		previous.LastScannedBlock = local.FinalizedBlock
@@ -498,7 +522,7 @@ func (c *controller) scanLocalRewardHistory(ctx context.Context, now time.Time, 
 		return previous, false, nil
 	}
 	from := previous.LastScannedBlock + 1
-	to := min(from+rewardScanChunkSize-1, finalized)
+	to := rewardScanEnd(previous.LastScannedBlock, finalized)
 	if c.rewardScanner == nil || c.rewardWriter == nil {
 		return previous, true, c.failRewardScan(now, fmt.Errorf("reward history dependency unavailable"))
 	}
@@ -510,6 +534,7 @@ func (c *controller) scanLocalRewardHistory(ctx context.Context, now time.Time, 
 		return previous, true, c.failRewardScan(now, err)
 	}
 	next := previous
+	next.Recovery = nil
 	for index := range scan.Observations {
 		observation := &scan.Observations[index]
 		if observation.Verification == "insufficient" || observation.Verification == "pot_empty" {
@@ -535,6 +560,15 @@ func (c *controller) scanLocalRewardHistory(ctx context.Context, now time.Time, 
 	c.rewardScanFailures = 0
 	c.rewardScanNext = now.Add(rewardScanInterval)
 	return next, true, nil
+}
+
+func rewardScanEnd(cursor, finalized int64) int64 {
+	lag := finalized - cursor
+	chunk := rewardScanChunkSize
+	if lag > store.RewardGapRetainedWindowBlocks {
+		chunk = min(lag, rewardScanMaxChunkSize)
+	}
+	return min(cursor+chunk, finalized)
 }
 
 func (c *controller) failRewardScan(now time.Time, err error) error {
@@ -821,6 +855,42 @@ func (c *controller) processJobs(ctx context.Context) {
 
 var manualActionIDPattern = regexp.MustCompile(`^act_[A-Za-z0-9_-]{16,100}$`)
 
+func validateManualAction(action *actionbroker.ManualAction) error {
+	action.Reason = strings.TrimSpace(action.Reason)
+	action.RequestedBy = strings.TrimSpace(action.RequestedBy)
+	action.IncidentID = strings.TrimSpace(action.IncidentID)
+	action.ActionKind = strings.TrimSpace(action.ActionKind)
+	if action.ActionKind == "" {
+		action.ActionKind = actionbroker.ActionRestartService
+	}
+	if len(action.Parameters) == 0 {
+		action.Parameters = json.RawMessage(`{}`)
+	}
+	if !manualActionIDPattern.MatchString(action.ActionID) || len(action.IdempotencyKey) < 1 || len(action.IdempotencyKey) > 100 || action.RequestedBy == "" || len(action.Reason) < 10 || len(action.Reason) > 1000 || !json.Valid(action.Parameters) {
+		return fmt.Errorf("invalid request")
+	}
+	switch action.ActionKind {
+	case actionbroker.ActionRestartService:
+		return nil
+	case actionbroker.ActionAcknowledgePrunedRewardGap:
+		var parameters actionbroker.RewardGapParameters
+		if err := json.Unmarshal(action.Parameters, &parameters); err != nil || parameters.ExpectedCursor <= 0 {
+			return fmt.Errorf("invalid reward gap parameters")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported action kind")
+	}
+}
+
+func sameManualActionParameters(kind string, left, right json.RawMessage) bool {
+	if kind == actionbroker.ActionAcknowledgePrunedRewardGap {
+		var a, b actionbroker.RewardGapParameters
+		return json.Unmarshal(left, &a) == nil && json.Unmarshal(right, &b) == nil && a == b
+	}
+	return kind == actionbroker.ActionRestartService
+}
+
 func (c *controller) startActionBroker() error {
 	path := c.cfg.ActionBrokerSock
 	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
@@ -872,19 +942,17 @@ func (c *controller) manualAction(w http.ResponseWriter, r *http.Request) {
 	var action actionbroker.ManualAction
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&action) != nil || decoder.Decode(&struct{}{}) != io.EOF || !manualActionIDPattern.MatchString(action.ActionID) || len(action.IdempotencyKey) < 1 || len(action.IdempotencyKey) > 100 || strings.TrimSpace(action.RequestedBy) == "" || len(strings.TrimSpace(action.Reason)) < 10 || len(strings.TrimSpace(action.Reason)) > 1000 {
+	if decoder.Decode(&action) != nil || decoder.Decode(&struct{}{}) != io.EOF || validateManualAction(&action) != nil {
 		writeControllerJSON(w, 400, actionbroker.Result{Error: "invalid_request"})
 		return
 	}
-	action.Reason = strings.TrimSpace(action.Reason)
-	action.RequestedBy = strings.TrimSpace(action.RequestedBy)
-	action.IncidentID = strings.TrimSpace(action.IncidentID)
 	var id string
-	err = c.store.DB.QueryRowContext(r.Context(), `INSERT INTO remediation_actions(id,idempotency_key,incident_id,requested_by,reason,mode,status) VALUES($1,$2,NULLIF($3,''),$4,$5,'manual','pending') ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, action.ActionID, action.IdempotencyKey, action.IncidentID, action.RequestedBy, action.Reason).Scan(&id)
+	err = c.store.DB.QueryRowContext(r.Context(), `INSERT INTO remediation_actions(id,idempotency_key,incident_id,requested_by,reason,action_kind,parameters,mode,status) VALUES($1,$2,NULLIF($3,''),$4,$5,$6,$7,'manual','pending') ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, action.ActionID, action.IdempotencyKey, action.IncidentID, action.RequestedBy, action.Reason, action.ActionKind, store.JSON(action.Parameters)).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		var incidentID, requestedBy, reason string
-		err = c.store.DB.QueryRowContext(r.Context(), `SELECT id,COALESCE(incident_id,''),requested_by,reason FROM remediation_actions WHERE idempotency_key=$1`, action.IdempotencyKey).Scan(&id, &incidentID, &requestedBy, &reason)
-		if err == nil && (incidentID != action.IncidentID || requestedBy != action.RequestedBy || reason != action.Reason) {
+		var incidentID, requestedBy, reason, actionKind string
+		var parameters json.RawMessage
+		err = c.store.DB.QueryRowContext(r.Context(), `SELECT id,COALESCE(incident_id,''),requested_by,reason,action_kind,parameters FROM remediation_actions WHERE idempotency_key=$1`, action.IdempotencyKey).Scan(&id, &incidentID, &requestedBy, &reason, &actionKind, &parameters)
+		if err == nil && (incidentID != action.IncidentID || requestedBy != action.RequestedBy || reason != action.Reason || actionKind != action.ActionKind || !sameManualActionParameters(actionKind, parameters, action.Parameters)) {
 			writeControllerJSON(w, 409, actionbroker.Result{Error: "idempotency_conflict"})
 			return
 		}
@@ -893,7 +961,11 @@ func (c *controller) manualAction(w http.ResponseWriter, r *http.Request) {
 		writeControllerJSON(w, 500, actionbroker.Result{Error: "database"})
 		return
 	}
-	c.store.Audit(r.Context(), "restart.manual.queue", action.RequestedBy, "queued", map[string]string{"action_id": id})
+	queueAudit := "restart.manual.queue"
+	if action.ActionKind == actionbroker.ActionAcknowledgePrunedRewardGap {
+		queueAudit = "reward.history_gap.queue"
+	}
+	c.store.Audit(r.Context(), queueAudit, action.RequestedBy, "queued", map[string]string{"action_id": id, "action_kind": action.ActionKind})
 	writeControllerJSON(w, 202, actionbroker.Result{ID: id, Status: "pending"})
 }
 
@@ -905,25 +977,51 @@ func (c *controller) processPendingAction() {
 	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
 	defer cancel()
 	var action model.RemediationAction
-	err := c.store.DB.QueryRowContext(ctx, `UPDATE remediation_actions SET status='running',started_at=now() WHERE id=(SELECT id FROM remediation_actions WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id,idempotency_key,COALESCE(incident_id,''),requested_by,reason,mode,status,created_at`).Scan(&action.ID, &action.IdempotencyKey, &action.IncidentID, &action.RequestedBy, &action.Reason, &action.Mode, &action.Status, &action.CreatedAt)
+	err := c.store.DB.QueryRowContext(ctx, `UPDATE remediation_actions SET status='running',started_at=now() WHERE id=(SELECT id FROM remediation_actions WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id,idempotency_key,COALESCE(incident_id,''),requested_by,reason,action_kind,parameters,mode,status,created_at`).Scan(&action.ID, &action.IdempotencyKey, &action.IncidentID, &action.RequestedBy, &action.Reason, &action.ActionKind, &action.Parameters, &action.Mode, &action.Status, &action.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) || err != nil {
 		return
 	}
-	baseline := c.snapshot().Chain.LocalFinalized
-	result, err := c.agent.Restart(ctx, action.ID, action.Reason)
-	if err == nil {
-		err = c.verifyRecovery(ctx, baseline)
+	var result any
+	auditAction := "action.execute"
+	subject := "[Shiden Guardian] 操作"
+	disableAutomationOnFailure := false
+	switch action.ActionKind {
+	case actionbroker.ActionRestartService:
+		baseline := c.snapshot().Chain.LocalFinalized
+		result, err = c.agent.Restart(ctx, action.ID, action.Reason)
+		if err == nil {
+			err = c.verifyRecovery(ctx, baseline)
+		}
+		auditAction = "restart.execute"
+		subject = "[Shiden Guardian] 再起動"
+		disableAutomationOnFailure = true
+	case actionbroker.ActionAcknowledgePrunedRewardGap:
+		var parameters actionbroker.RewardGapParameters
+		if decodeErr := json.Unmarshal(action.Parameters, &parameters); decodeErr != nil {
+			err = fmt.Errorf("decode reward gap action: %w", decodeErr)
+		} else {
+			func() {
+				c.rewardMu.Lock()
+				defer c.rewardMu.Unlock()
+				result, err = acknowledgePrunedRewardGap(ctx, c.agent, c.store, parameters.ExpectedCursor, store.RewardGapApproval{Actor: action.RequestedBy, Reason: action.Reason, ActionID: action.ID})
+			}()
+		}
+		auditAction = "reward.history_gap.execute"
+		subject = "[Shiden Guardian] 報酬監視履歴の再基準化"
+	default:
+		err = fmt.Errorf("unknown remediation action kind: %s", action.ActionKind)
 	}
 	status := "succeeded"
 	if err != nil {
 		status = "failed"
 		result = map[string]any{"error": err.Error()}
-		_ = c.store.SetSetting(ctx, "automation_enabled", false)
+		if disableAutomationOnFailure {
+			_ = c.store.SetSetting(ctx, "automation_enabled", false)
+		}
 	}
 	_, _ = c.store.DB.ExecContext(ctx, `UPDATE remediation_actions SET status=$2,result=$3,finished_at=now() WHERE id=$1`, action.ID, status, store.JSON(result))
-	c.store.Audit(ctx, "restart.execute", "controller", status, map[string]any{"action_id": action.ID, "mode": action.Mode})
-	subject := "[Shiden Guardian] 再起動 " + status
-	_ = c.mail.Send(ctx, subject, fmt.Sprintf("ノード: %s\nAction: %s\n結果: %s\n理由: %s", c.cfg.NodeName, action.ID, status, action.Reason))
+	c.store.Audit(ctx, auditAction, "controller", status, map[string]any{"action_id": action.ID, "action_kind": action.ActionKind, "mode": action.Mode})
+	_ = c.mail.Send(ctx, subject+" "+status, fmt.Sprintf("ノード: %s\nAction: %s\n種別: %s\n結果: %s\n理由: %s", c.cfg.NodeName, action.ID, action.ActionKind, status, action.Reason))
 }
 func (c *controller) verifyRecovery(ctx context.Context, baseline int64) error {
 	activeDeadline := time.Now().Add(2 * time.Minute)
@@ -967,7 +1065,12 @@ func (c *controller) serveMetrics() {
 		if state.Rewards.ActiveSession {
 			activeSet = 1
 		}
-		fmt.Fprintf(w, "# HELP guardian_node_up Whether astar.service is active.\n# TYPE guardian_node_up gauge\nguardian_node_up %d\nguardian_local_finalized %d\nguardian_external_height %d\nguardian_sync_lag %d\nguardian_peers %d\nguardian_host_cpu_percent %.3f\nguardian_host_memory_percent %.3f\nguardian_host_disk_percent %.3f\nguardian_collator_active_set %d\nguardian_collator_last_authored_block %d\nguardian_collator_blocks_since_authored %d\nguardian_collator_seconds_since_reward %d\nguardian_collator_reward_events_total %d\nguardian_collator_reward_sdn_total %.12f\nguardian_collator_reward_sdn_last %.12f\nguardian_collator_wallet_free_sdn %.12f\n", up, state.Chain.LocalFinalized, state.Chain.ExternalHeight, state.Chain.Lag, state.Chain.Peers, state.Host.CPU, state.Host.Memory, state.Host.Disk, activeSet, state.Rewards.LastAuthoredBlock, state.Rewards.BlocksSinceAuthored, state.Rewards.SecondsSinceReward, state.Rewards.RewardTotalCount, planckSDN(state.Rewards.RewardTotalPlanck), planckSDN(state.Rewards.LastRewardPlanck), planckSDN(state.Rewards.WalletFreePlanck))
+		recoveryRequired := 0
+		if state.Rewards.Recovery != nil && state.Rewards.Recovery.Required {
+			recoveryRequired = 1
+		}
+		cursorLag := max64(0, state.Rewards.FinalizedBlock-state.Rewards.LastScannedBlock)
+		fmt.Fprintf(w, "# HELP guardian_node_up Whether astar.service is active.\n# TYPE guardian_node_up gauge\nguardian_node_up %d\nguardian_local_finalized %d\nguardian_external_height %d\nguardian_sync_lag %d\nguardian_peers %d\nguardian_host_cpu_percent %.3f\nguardian_host_memory_percent %.3f\nguardian_host_disk_percent %.3f\nguardian_collator_active_set %d\nguardian_collator_last_authored_block %d\nguardian_collator_blocks_since_authored %d\nguardian_collator_seconds_since_reward %d\nguardian_collator_reward_events_total %d\nguardian_collator_reward_sdn_total %.12f\nguardian_collator_reward_sdn_last %.12f\nguardian_collator_wallet_free_sdn %.12f\n# HELP guardian_collator_reward_cursor_lag Finalized blocks not yet scanned for rewards.\n# TYPE guardian_collator_reward_cursor_lag gauge\nguardian_collator_reward_cursor_lag %d\n# HELP guardian_collator_reward_recovery_required Whether an operator-approved pruning-gap recovery is required.\n# TYPE guardian_collator_reward_recovery_required gauge\nguardian_collator_reward_recovery_required %d\n", up, state.Chain.LocalFinalized, state.Chain.ExternalHeight, state.Chain.Lag, state.Chain.Peers, state.Host.CPU, state.Host.Memory, state.Host.Disk, activeSet, state.Rewards.LastAuthoredBlock, state.Rewards.BlocksSinceAuthored, state.Rewards.SecondsSinceReward, state.Rewards.RewardTotalCount, planckSDN(state.Rewards.RewardTotalPlanck), planckSDN(state.Rewards.LastRewardPlanck), planckSDN(state.Rewards.WalletFreePlanck), cursorLag, recoveryRequired)
 		for source, status := range state.Rewards.Sources {
 			ok := 0
 			if status == "ok" {

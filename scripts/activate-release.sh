@@ -123,6 +123,26 @@ if ! docker compose exec -T api /usr/local/bin/api -healthcheck || ! docker comp
   docker compose logs --tail=120 api auth-broker controller
   exit 1
 fi
+
+# Reward monitoring is fail-closed and may require an explicit operator action
+# after astar.service catches up faster than historical state is retained. This
+# is an application warning, not a reason to roll back an otherwise healthy
+# release after credential rotation.
+reward_recovery_state=""
+reward_check_attempt=1
+while [ "$reward_check_attempt" -le 2 ]; do
+  reward_recovery_state="$(docker compose exec -T postgres psql -U guardian -d guardian -Atc "SELECT COALESCE(payload->'recovery'->>'reason','')||'|'||last_scanned_block||'|'||COALESCE(payload->'recovery'->>'candidate_resume_from_block','') FROM reward_monitor_state WHERE id=1" 2>/dev/null || true)"
+  case "$reward_recovery_state" in
+    local_state_pruned\|*) break ;;
+  esac
+  reward_check_attempt=$((reward_check_attempt + 1))
+  if [ "$reward_check_attempt" -le 2 ]; then sleep 15; fi
+done
+case "$reward_recovery_state" in
+  local_state_pruned\|*)
+    printf 'WARNING: Reward history state was pruned (%s). Sign in to the Rewards page and approve the audited history-gap recovery. No reward events will be synthesized.\n' "$reward_recovery_state" >&2
+    ;;
+esac
 if ! docker compose exec -T api /bin/sh -c 'test -e /run/secrets/api_database_url && test ! -e /run/secrets/auth_database_url && test ! -e /run/secrets/controller_database_url && test ! -e /run/secrets/postgres_password && test ! -e /run/secrets/encryption_key && test ! -e /run/secrets/action_broker_key && test ! -e /run/shiden-guardian/action-broker/controller.sock'; then
   echo "API privilege separation check failed" >&2
   exit 1

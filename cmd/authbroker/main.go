@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -103,6 +104,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/auth/login", s.login)
 	mux.Handle("POST /api/v1/auth/logout", s.requireAuth(http.HandlerFunc(s.logout)))
 	mux.Handle("POST /api/v1/actions/restart", s.requireAuth(http.HandlerFunc(s.restart)))
+	mux.Handle("POST /api/v1/actions/reward-gap/acknowledge", s.requireAuth(http.HandlerFunc(s.acknowledgeRewardGap)))
 	mux.Handle("PUT /api/v1/settings", s.requireAuth(http.HandlerFunc(s.updateSettings)))
 	handler := securityHeaders(requestLogger(s.caddyOnly(mux)))
 	httpServer := &http.Server{Addr: cfg.ListenAddress, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
@@ -571,7 +573,7 @@ func (s *server) restart(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "internal"})
 		return
 	}
-	status, result, err := s.actions.Submit(r.Context(), actionbroker.ManualAction{ActionID: id, IdempotencyKey: key, IncidentID: body.IncidentID, RequestedBy: x.Username, Reason: reason})
+	status, result, err := s.actions.Submit(r.Context(), actionbroker.ManualAction{ActionID: id, IdempotencyKey: key, IncidentID: body.IncidentID, RequestedBy: x.Username, Reason: reason, ActionKind: actionbroker.ActionRestartService, Parameters: json.RawMessage(`{}`)})
 	if err != nil {
 		writeJSON(w, 503, map[string]string{"error": "controller_unavailable"})
 		return
@@ -584,6 +586,73 @@ func (s *server) restart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.store.Audit(r.Context(), "restart.request", x.Username, "queued", map[string]string{"action_id": result.ID})
+	writeJSON(w, 202, map[string]string{"id": result.ID, "status": "pending"})
+}
+
+func (s *server) acknowledgeRewardGap(w http.ResponseWriter, r *http.Request) {
+	x := currentUser(r)
+	var body struct {
+		Password       string `json:"password"`
+		TOTP           string `json:"totp_code"`
+		Reason         string `json:"reason"`
+		Confirm        string `json:"confirm"`
+		ExpectedCursor int64  `json:"expected_cursor"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	reason := strings.TrimSpace(body.Reason)
+	expectedConfirmation := fmt.Sprintf("PRUNED GAP %d", body.ExpectedCursor)
+	if body.ExpectedCursor <= 0 || body.Confirm != expectedConfirmation || len(reason) < 10 || len(reason) > 1000 {
+		s.store.Audit(r.Context(), "reward.history_gap.request", x.Username, "denied", map[string]any{})
+		writeJSON(w, 403, map[string]string{"error": "step_up_failed"})
+		return
+	}
+	valid, busy := s.stepUp(x, body.Password, body.TOTP)
+	if busy {
+		s.tooMany(w, time.Second)
+		return
+	}
+	if !valid {
+		s.store.Audit(r.Context(), "reward.history_gap.request", x.Username, "denied", map[string]any{})
+		writeJSON(w, 403, map[string]string{"error": "step_up_failed"})
+		return
+	}
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" || len(key) > 100 {
+		writeJSON(w, 400, map[string]string{"error": "idempotency_key_required"})
+		return
+	}
+	id, err := store.NewID("act")
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "internal"})
+		return
+	}
+	parameters, err := json.Marshal(actionbroker.RewardGapParameters{ExpectedCursor: body.ExpectedCursor})
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "internal"})
+		return
+	}
+	status, result, err := s.actions.Submit(r.Context(), actionbroker.ManualAction{
+		ActionID:       id,
+		IdempotencyKey: key,
+		RequestedBy:    x.Username,
+		Reason:         reason,
+		ActionKind:     actionbroker.ActionAcknowledgePrunedRewardGap,
+		Parameters:     parameters,
+	})
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "controller_unavailable"})
+		return
+	}
+	if status/100 != 2 {
+		if result.Error == "" {
+			result.Error = "controller_rejected"
+		}
+		writeJSON(w, status, map[string]string{"error": result.Error})
+		return
+	}
+	s.store.Audit(r.Context(), "reward.history_gap.request", x.Username, "queued", map[string]any{"action_id": result.ID, "expected_cursor": body.ExpectedCursor})
 	writeJSON(w, 202, map[string]string{"id": result.ID, "status": "pending"})
 }
 

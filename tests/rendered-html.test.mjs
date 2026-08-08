@@ -33,6 +33,10 @@ test("日英UI、言語保存、公開ステータス、報酬監視画面を静
   assert.match(compiled, /Collator binary/);
   assert.match(compiled, /コレーターバイナリ/);
   assert.match(compiled, /beelink-mini-s\.png/);
+  assert.match(compiled, /PRUNED GAP/);
+  assert.match(compiled, /\/actions\/reward-gap\/acknowledge/);
+  assert.match(compiled, /監査付きで報酬監視を再開/);
+  assert.match(compiled, /Resume reward monitoring with audit/);
   assert.doesNotMatch(compiled, /All administrative actions are audited/);
   assert.doesNotMatch(compiled, /管理操作はすべて記録され/);
 });

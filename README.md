@@ -50,7 +50,7 @@ Composeは`caddy`、`api`、`auth-broker`、`controller`、`prometheus`、`postg
 - **インシデント**: ルール検知、Gemini診断、復旧・解決状態と証拠を確認します。
 - **メンテナンス**: 手動再起動を、パスワード、TOTP、理由、確認、idempotency key付きで実行します。
 - **設定・監査**: observe-only状態、メール・Gemini接続テスト、認証・設定・操作の監査履歴を確認します。
-- **報酬**: active set、最終報酬、24時間報酬、残高、作成間隔、日別・累計報酬、block単位の検証証拠を表示します。
+- **報酬**: active set、最終報酬、24時間報酬、残高、作成間隔、日別・累計報酬、block単位の検証証拠を表示します。pruning専用の復旧警告、監査付き承認、永久欠損となった直近history gapもこの画面で確認します。
 
 Web UIは英語を初期表示とし、画面上の`EN / 日本語`トグルで即時に切り替えられます。選択はブラウザーへ保存され、数値表記は表示言語に従います。時刻は両言語とも`Asia/Tokyo`です。既知のインシデント名は表示言語へ変換しますが、journaldの生ログ、保存済みAI診断、未知のインシデント名は証拠の原文を維持します。通知メールと新規AI診断の生成言語は引き続き日本語です。
 
@@ -82,11 +82,18 @@ Polkadot Telemetryは状況確認用リンクとして使いますが、その�
 
 SDNは小数18桁で、`1 SDN = 10^18 Planck`です。DBでは`numeric(39,0)`、JSONでは10進文字列を使い、JavaScriptの数値精度損失を避けます。対応済みruntime specは`2208`と`2300`です。未知のruntimeやAccountInfo形式を検出した場合、金額判定を止めてfail-closedで「報酬監視劣化」と通知します。
 
-導入前の履歴は推測しません。Activation時のfinalized blockを開始点として、以降の証拠だけを保存します。controller停止中はDB cursorから再開し、pruning等で補えない区間は監視gapとして残します。履歴カーソルを進められるのは確定済みローカルRPCだけで、外部RPC単独の結果では進めません。走査は15秒に1回・最大16ブロックの1チャンクに制限し、RPCまたはDB失敗時は15秒から最大5分までbackoffします。報酬イベントのupsertとcursor更新は同一transactionで行い、競合や1件の保存失敗でも全体をrollbackします。外部RPCはsnapshot quorumと異常候補1ブロックの確認だけに使い、429や停止時は1・2・4・8・15分backoffして「報酬未取得」と誤判定しません。
+導入前の履歴は推測しません。Activation時のfinalized blockを開始点として、以降の証拠だけを保存します。controller停止中はDB cursorから再開し、pruning等で補えない区間は監視gapとして残します。履歴カーソルを進められるのは確定済みローカルRPCだけで、外部RPC単独の結果では進めません。通常走査は15秒に1回・最大16ブロック、cursorが64ブロックを超えて遅延したcatch-up時はローカルRPCの既存上限内で最大128ブロックに拡張します。scannerとDB保存層は同じ128ブロックの共有上限を使い、129ブロック以上の遷移はcursorを変更せず拒否します。RPCまたはDB失敗時は15秒から最大5分までbackoffします。報酬イベントのupsertとcursor更新は同一transactionで行い、競合や1件の保存失敗でも全体をrollbackします。外部RPCはsnapshot quorumと異常候補1ブロックの確認だけに使い、429や停止時は1・2・4・8・15分backoffして「報酬未取得」と誤判定しません。
 
 active set所属中かつShiden chainが進行しているとき、最後の確認済み報酬から15分で警告、30分で重大です。active set離脱は2ソースで連続確認後に重大化します。service停止、同期停止、Shiden全体停止中は報酬メールを重複させず、既存インシデントへ「報酬取得リスク」を追加します。
 
 **報酬系インシデントは常に自動再起動対象外です。** Geminiが再起動を提案しても自動操作へ進みません。
+
+### pruning gap復旧のAPI・保存・メトリクス
+
+- `POST /api/v1/actions/reward-gap/acknowledge`は、session、CSRF、password、TOTP、`Idempotency-Key`を必須とします。本文の`reason`は10文字以上、`confirm`は`PRUNED GAP <expected_cursor>`との完全一致が必要です。受理時は`202`とaction IDを返し、controllerが実行時にcursorとRPC stateを再検証します。
+- restartと報酬gap復旧は同じ直列action queueを使います。`remediation_actions.action_kind`は既存行で`restart_service`、`parameters`は空JSONを既定値とする後方互換列です。報酬復旧の失敗ではnode自動化設定を無効化しません。
+- Prometheusでは`guardian_collator_reward_cursor_lag`がfinalized blockとの差、`guardian_collator_reward_recovery_required`が明示承認の要否を表します。
+- 承認成功時はcursor更新、history gap、実ユーザー名、理由、action ID、監査eventを同一DB transactionで保存します。欠損区間の`reward_events`は作成しません。
 
 ## Gemini診断と限定自動復旧
 
@@ -282,6 +289,8 @@ sudo sh scripts/activate-controller-release.sh /home/tk/shiden-guardian <VERSION
 
 この経路は現行`.env`とruntime secretを値を表示せずbyte単位で照合し、`migration_database_url`と旧`database_url`を拒否します。旧controllerを稼働させたまま新imageをbuildし、`docker compose up -d --no-deps --force-recreate --wait controller`だけで切り替えます。DB、API、auth-broker、Caddy、Prometheus、backup、host agent、Astarの再作成・再起動を検知すると失敗し、旧controller imageと旧releaseへ自動rollbackします。
 
+切替後に新controllerが`local_state_pruned`を構造化検出した場合だけは、cursorを変更せず、旧controllerへrollbackせずに警告を表示してActivationを完了します。その後、Rewards画面から監査付き復旧を明示承認します。一般RPC障害や不明なgapで追いつけない場合は、従来どおりcontroller-only Activationを失敗させてrollbackします。
+
 ローカルnodeのstate pruningにより未走査履歴がすでに破棄されている場合だけ、運用者の明示承認後に監査付き再基準化を使えます。
 
 ```sh
@@ -291,6 +300,8 @@ sudo sh scripts/activate-controller-release.sh \
 ```
 
 このモードは旧cursorの走査がローカルRPCから`State already discarded`で拒否され、同じローカルRPCの最新保持範囲が正常走査できることを確認してから、controllerだけを停止します。`finalized - 64`を再開基準として、破棄済み区間、再開block、`history_recovered=false`、local RPC権威であることを`reward.history_gap.acknowledge`監査へcursor更新と同一transactionで保存します。破棄済み区間の報酬eventを合成せず、`sources.historical_gap`にも永続的な印を残します。通常走査がRPC失敗時にcursorを進めない規則は変更しません。
+
+稼働中に同じ状態を検出した場合は、報酬画面に「監査付きで報酬監視を再開」が表示されます。管理者のpassword、TOTP、理由、画面に示された`PRUNED GAP <cursor>`の入力後、controllerが上記の旧state破棄と最新保持範囲を再検証してから同じtransactionを実行します。このWeb操作も破棄区間のeventを作成せず、24時間・日次・累計には永続的な履歴gapが残ります。CLIモードはWeb経路が利用できない場合のbreak-glass用です。
 
 ## 日常確認
 
@@ -316,6 +327,8 @@ Web UIの「設定・監査」からメールとGeminiの接続テストを行�
 ### 報酬が「収集中」または「監視劣化」になる
 
 導入直後は最初のfinalized報酬まで履歴がありません。`active set`、quorum、runtime spec、local RPC、外部2系統の状態、監視gapを確認します。RPC 429や証拠不一致は報酬未取得とは判定されません。
+
+警告に`local_state_pruned`または`State already discarded`が表示され、報酬画面に復旧ボタンがある場合は、Subscanの履歴を取り込まず監視cursorだけを再基準化する承認操作です。表示された欠損block範囲と、欠損区間が集計へ含まれないことを確認してから実行してください。最新保持範囲の検証に失敗した場合はcursorを変更せず失敗監査を残します。
 
 ### host agentのsocketがない
 

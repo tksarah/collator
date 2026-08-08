@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const RewardWallet = "WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN"
 
@@ -59,6 +62,22 @@ type Overview struct {
 	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
+type RewardRecovery struct {
+	Required                 bool   `json:"required"`
+	Reason                   string `json:"reason"`
+	ExpectedCursor           int64  `json:"expected_cursor"`
+	CandidateResumeFromBlock int64  `json:"candidate_resume_from_block"`
+}
+
+type RewardHistoryGap struct {
+	FromBlock        int64     `json:"from_block"`
+	ThroughBlock     int64     `json:"through_block"`
+	ResumeFromBlock  int64     `json:"resume_from_block"`
+	AcknowledgedAt   time.Time `json:"acknowledged_at"`
+	AcknowledgedBy   string    `json:"acknowledged_by"`
+	HistoryRecovered bool      `json:"history_recovered"`
+}
+
 // RewardOverview contains only public, read-only chain data. Planck amounts are
 // strings so JSON consumers never lose precision converting uint128 values.
 type RewardOverview struct {
@@ -86,6 +105,8 @@ type RewardOverview struct {
 	InactiveConfirmations int               `json:"inactive_confirmations"`
 	Sources               map[string]string `json:"sources"`
 	Gap                   string            `json:"gap,omitempty"`
+	Recovery              *RewardRecovery   `json:"recovery,omitempty"`
+	LastHistoryGap        *RewardHistoryGap `json:"last_history_gap,omitempty"`
 }
 
 type RewardObservation struct {
@@ -168,14 +189,16 @@ type AgentSnapshot struct {
 }
 
 type RemediationAction struct {
-	ID             string    `json:"id"`
-	IdempotencyKey string    `json:"idempotency_key"`
-	IncidentID     string    `json:"incident_id,omitempty"`
-	RequestedBy    string    `json:"requested_by"`
-	Reason         string    `json:"reason"`
-	Mode           string    `json:"mode"`
-	Status         string    `json:"status"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             string          `json:"id"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	IncidentID     string          `json:"incident_id,omitempty"`
+	RequestedBy    string          `json:"requested_by"`
+	Reason         string          `json:"reason"`
+	ActionKind     string          `json:"action_kind"`
+	Parameters     json.RawMessage `json:"parameters,omitempty"`
+	Mode           string          `json:"mode"`
+	Status         string          `json:"status"`
+	CreatedAt      time.Time       `json:"created_at"`
 }
 
 type AuditEvent struct {

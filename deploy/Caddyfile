@@ -30,6 +30,15 @@
 			header_up X-Real-IP {remote_host}
 		}
 	}
+	@reward_gap_acknowledge {
+		method POST
+		path /api/v1/actions/reward-gap/acknowledge
+	}
+	handle @reward_gap_acknowledge {
+		reverse_proxy auth-broker:8081 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
 	@settings_update {
 		method PUT
 		path /api/v1/settings

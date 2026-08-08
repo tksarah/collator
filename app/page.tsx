@@ -5,12 +5,15 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { I18nProvider, LanguageToggle, LocalizedMessage, MessageKey, MessageValues, useI18n } from "./i18n";
 
 type Tab = "overview" | "metrics" | "rewards" | "logs" | "incidents" | "maintenance" | "settings";
+type RewardRecovery = { required: boolean; reason: string; expected_cursor: number; candidate_resume_from_block: number };
+type RewardHistoryGap = { from_block: number; through_block: number; resume_from_block: number; acknowledged_at: string; acknowledged_by: string; history_recovered: boolean };
 type RewardOverview = {
   address: string; status: string; monitoring_started_at?: string; active_session: boolean; validator_count: number;
   finalized_block: number; last_scanned_block: number; last_authored_block: number; last_reward_at?: string;
   seconds_since_reward: number; blocks_since_authored: number; kick_blocks_remaining: number; wallet_free_planck: string;
   last_reward_planck: string; reward_24h_planck: string; reward_24h_count: number; reward_total_planck: string;
   reward_total_count: number; spec_version: number; schema_ok: boolean; quorum: number; inactive_confirmations?: number; sources: Record<string, string>; gap?: string;
+  recovery?: RewardRecovery; last_history_gap?: RewardHistoryGap;
 };
 type RewardObservation = { block_number: number; block_hash: string; authored_at: string; expected_planck: string; credited_planck: string; verification: string; source_count: number };
 type RewardDaily = { day: string; amount_planck: string; count: number };
@@ -216,6 +219,7 @@ function Dashboard() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [restartOpen, setRestartOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [rewardRecovery, setRewardRecovery] = useState<RewardRecovery | null>(null);
   const [notice, setNotice] = useState<MessageState>(null);
 
   const refresh = useCallback(async () => {
@@ -318,7 +322,7 @@ function Dashboard() {
         {notice && <div className="notice" role="status">{localized(notice, t)}<button aria-label={t("common.close")} onClick={() => setNotice(null)}>×</button></div>}
         {tab === "overview" && <OverviewTab data={overview} demo={demo} onRestart={() => setRestartOpen(true)} />}
         {tab === "metrics" && <MetricsTab data={overview} demo={demo} />}
-        {tab === "rewards" && <RewardsTab overview={overview.rewards} demo={demo} />}
+        {tab === "rewards" && <RewardsTab overview={overview.rewards} demo={demo} onRecover={setRewardRecovery} />}
         {tab === "logs" && <LogsTab lines={logs} demo={demo} />}
         {tab === "incidents" && <IncidentsTab incidents={overview.incidents} demo={demo} onDiagnose={async () => { if (!demo) await api("/diagnoses", { method: "POST", body: "{}" }); setNotice(message("notice.diagnosisQueued")); }} />}
         {tab === "maintenance" && <MaintenanceTab data={overview} onRestart={() => setRestartOpen(true)} />}
@@ -326,6 +330,7 @@ function Dashboard() {
       </section>
       {restartOpen && <RestartDialog demo={demo} onClose={() => setRestartOpen(false)} onDone={(nextMessage) => { setRestartOpen(false); setNotice(nextMessage); }} />}
       {automationOpen && <AutomationDialog enabled={overview.automation.enabled} onClose={() => setAutomationOpen(false)} onDone={(nextMessage) => { setAutomationOpen(false); setNotice(nextMessage); refresh(); }} />}
+      {rewardRecovery && <RewardRecoveryDialog recovery={rewardRecovery} onClose={() => setRewardRecovery(null)} onDone={(nextMessage) => { setRewardRecovery(null); setNotice(nextMessage); void refresh(); }} />}
     </main>
   );
 }
@@ -493,7 +498,7 @@ function MetricsTab({ data, demo }: { data: Overview; demo: boolean }) {
   })}</div></div>;
 }
 
-function RewardsTab({ overview, demo }: { overview: RewardOverview; demo: boolean }) {
+function RewardsTab({ overview, demo, onRecover }: { overview: RewardOverview; demo: boolean; onRecover: (recovery: RewardRecovery) => void }) {
   const { t, formatNumber, formatDateTime, formatDuration, formatPlanck, formatEnum, formatItemCount, formatBlockCount } = useI18n();
   const [page, setPage] = useState<RewardPage>({ summary: overview, items: [], daily: [] });
   const [loading, setLoading] = useState(!demo);
@@ -518,6 +523,11 @@ function RewardsTab({ overview, demo }: { overview: RewardOverview; demo: boolea
 
   const displayedPage = demo ? { summary: overview, items: demoItems, daily: demoDaily } : page;
   const summary = displayedPage.summary;
+  const heroTitle = summary.recovery?.required
+    ? t("rewards.recoveryRequired")
+    : summary.status === "degraded"
+      ? t("rewards.monitoringDegraded")
+      : summary.active_session ? t("rewards.monitoringHealthy") : t("rewards.checkActiveSet");
   const chronological = useMemo(()=>[...displayedPage.items].sort((a,b)=>new Date(a.authored_at).getTime()-new Date(b.authored_at).getTime()),[displayedPage.items]);
   const intervals = useMemo<ChartSeries[]>(()=>{
     const points=chronological.slice(1).map((item,index)=>({timestamp:new Date(item.authored_at).getTime()/1000,value:(new Date(item.authored_at).getTime()-new Date(chronological[index].authored_at).getTime())/1000}));
@@ -531,14 +541,15 @@ function RewardsTab({ overview, demo }: { overview: RewardOverview; demo: boolea
 
   return <div className="page-content reward-page">
     <div className="section-intro"><div><span className="eyebrow">ON-CHAIN REWARD PROOF</span><h2>{t("rewards.title")}</h2><p className="section-copy">{t("rewards.description")}</p></div><a className="outline-button reward-link" href={`https://shiden.subscan.io/account/${summary.address}`} target="_blank" rel="noreferrer">{t("rewards.openSubscan")}</a></div>
-    <section className={`reward-hero ${summary.status}`}><div><span className={`reward-health ${summary.status}`}><i />{formatEnum(summary.status).toUpperCase()}</span><h3>{summary.active_session ? t("rewards.monitoringHealthy") : t("rewards.checkActiveSet")}</h3><p>{summary.last_reward_at ? t("rewards.lastConfirmed", { time: formatDateTime(summary.last_reward_at), duration: formatDuration(summary.seconds_since_reward) }) : t("rewards.waitingFirst")}</p></div><div className="reward-address"><span>REWARD WALLET</span><code title={summary.address}>{summary.address}</code><small>runtime spec {summary.spec_version || "—"} · quorum {summary.quorum}/3</small></div></section>
+    <section className={`reward-hero ${summary.status}`}><div><span className={`reward-health ${summary.status}`}><i />{formatEnum(summary.status).toUpperCase()}</span><h3>{heroTitle}</h3><p>{summary.last_reward_at ? t("rewards.lastConfirmed", { time: formatDateTime(summary.last_reward_at), duration: formatDuration(summary.seconds_since_reward) }) : t("rewards.waitingFirst")}</p></div><div className="reward-address"><span>REWARD WALLET</span><code title={summary.address}>{summary.address}</code><small>runtime spec {summary.spec_version || "—"} · quorum {summary.quorum}/3</small></div></section>
     <div className="reward-card-grid">
       <MetricCard label="ACTIVE SET" value={summary.active_session ? t("rewards.inSet", { count: summary.validator_count }) : t("rewards.notApplicable")} sub={summary.active_session ? t("rewards.currentSession") : t("rewards.needsAttention")} accent={summary.active_session ? "green" : "amber"} />
       <MetricCard label="LAST REWARD" value={summary.last_reward_at ? formatDuration(summary.seconds_since_reward) : t("common.collecting")} sub={`block #${formatNumber(summary.last_authored_block || 0)}`} accent="violet" />
       <MetricCard label="24 HOURS" value={formatPlanck(summary.reward_24h_planck)} sub={formatBlockCount(summary.reward_24h_count)} accent="blue" />
       <MetricCard label="WALLET" value={formatPlanck(summary.wallet_free_planck)} sub={t("overview.walletBalance")} accent="amber" />
     </div>
-    {(summary.gap||!summary.schema_ok||summary.quorum<2)&&<div className="reward-warning" role="status">{t("rewards.warningEvidence")}{summary.gap&&<small>{summary.gap}</small>}</div>}
+    {(summary.gap||!summary.schema_ok||summary.quorum<2)&&<div className="reward-warning" role="status"><strong>{summary.recovery?.required?t("rewards.prunedWarning"):t("rewards.warningEvidence")}</strong>{summary.gap&&<small>{summary.gap}</small>}{summary.recovery?.required&&<button className="primary-button" disabled={demo} onClick={()=>onRecover(summary.recovery!)}>{t("rewards.recoveryAction")}</button>}</div>}
+    {summary.last_history_gap&&<div className="reward-history-gap" role="status">{t("rewards.historyGap",{from:formatNumber(summary.last_history_gap.from_block),through:formatNumber(summary.last_history_gap.through_block),resume:formatNumber(summary.last_history_gap.resume_from_block),actor:summary.last_history_gap.acknowledged_by})}</div>}
     <div className="metrics-layout reward-charts">
       <section className="panel metric-chart"><PanelTitle overline="PROMETHEUS" title={t("rewards.cumulative")} action={formatPlanck(summary.reward_total_planck)} /><TimeSeriesChart ariaLabel={t("rewards.cumulativeChart")} series={cumulative} loading={prometheus.loading} error={prometheus.error} yDomain={[Math.max(0,cumulativeMin-(cumulativeMax-cumulativeMin)*.1),cumulativeMax+(cumulativeMax-cumulativeMin||1)*.1]} formatValue={(value)=>`${value.toFixed(3)} SDN`} /></section>
       <section className="panel metric-chart"><PanelTitle overline="AUTHORSHIP" title={t("rewards.interval")} action={summary.last_reward_at?formatDuration(summary.seconds_since_reward):t("common.collecting")} /><TimeSeriesChart ariaLabel={t("rewards.intervalChart")} series={intervals} loading={loading} error={error} thresholds={[{value:900,label:t("rewards.warning15m"),color:"#f2bd66"},{value:1800,label:t("rewards.critical30m"),color:"#ff6b7a"}]} yDomain={[0,intervalMax]} formatValue={(value)=>formatDuration(Math.round(value))} /></section>
@@ -659,6 +670,27 @@ function RestartDialog({ demo, onClose, onDone }: { demo: boolean; onClose: () =
     try { await api("/actions/restart", { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ password: form.get("password"), totp_code: form.get("totp"), reason: form.get("reason"), confirm: form.get("confirm") }) }); onDone(message("restart.accepted")); } catch (e) { setError(e instanceof Error && e.message ? e.message : message("restart.error.generic")); }
   }
   return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="restart-title"><button className="modal-close" aria-label={t("common.close")} onClick={onClose}>×</button><LanguageToggle className="modal-language-toggle" /><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="restart-title">{t("restart.title")}</h2><p>{t("restart.description")}</p><form onSubmit={submit}><label>{t("restart.reason")}<textarea name="reason" minLength={10} required placeholder={t("restart.reasonPlaceholder")} /></label><label>{t("common.password")}<input name="password" type="password" required /></label><label>{t("common.authCode")}<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>{t("restart.confirmLabel")}<input name="confirm" placeholder="tk_sdn_collator" required /></label>{error && <p className="form-error">{localized(error, t)}</p>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>{t("common.cancel")}</button><button type="submit" className="primary-button danger-fill">{t("restart.submit")}</button></div></form></section></div>;
+}
+
+function RewardRecoveryDialog({ recovery, onClose, onDone }: { recovery: RewardRecovery; onClose: () => void; onDone: (x: MessageState) => void }) {
+  const { t, formatNumber } = useI18n();
+  const [error, setError] = useState<MessageState>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const confirmation = `PRUNED GAP ${recovery.expected_cursor}`;
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    if (form.get("confirm") !== confirmation) { setError(message("rewardRecovery.error.confirm", { confirmation })); return; }
+    setSubmitting(true);
+    try {
+      await api("/actions/reward-gap/acknowledge", { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ password: form.get("password"), totp_code: form.get("totp"), reason: form.get("reason"), confirm: form.get("confirm"), expected_cursor: recovery.expected_cursor }) });
+      onDone(message("rewardRecovery.accepted"));
+    } catch (e) {
+      setError(e instanceof Error && e.message ? e.message : message("rewardRecovery.error.generic"));
+      setSubmitting(false);
+    }
+  }
+  return <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="reward-recovery-title"><button className="modal-close" aria-label={t("common.close")} onClick={onClose}>×</button><LanguageToggle className="modal-language-toggle" /><span className="eyebrow">STEP-UP AUTHENTICATION</span><h2 id="reward-recovery-title">{t("rewardRecovery.title")}</h2><p>{t("rewardRecovery.description",{from:formatNumber(recovery.expected_cursor+1),resume:formatNumber(recovery.candidate_resume_from_block)})}</p><p className="recovery-data-warning">{t("rewardRecovery.dataWarning")}</p><form onSubmit={submit}><label>{t("rewardRecovery.reason")}<textarea name="reason" minLength={10} maxLength={1000} required placeholder={t("rewardRecovery.reasonPlaceholder")} /></label><label>{t("common.password")}<input name="password" type="password" required /></label><label>{t("common.authCode")}<input name="totp" inputMode="numeric" pattern="[0-9]{6}" required /></label><label>{t("rewardRecovery.confirmLabel",{confirmation})}<input name="confirm" autoComplete="off" required /></label>{error&&<p className="form-error">{localized(error,t)}</p>}<div className="modal-actions"><button type="button" className="outline-button" disabled={submitting} onClick={onClose}>{t("common.cancel")}</button><button type="submit" className="primary-button" disabled={submitting}>{submitting?t("rewardRecovery.submitting"):t("rewardRecovery.submit")}</button></div></form></section></div>;
 }
 
 function MetricCard({ label, value, sub, detail, accent }: { label: string; value: string; sub: string; detail?: string; accent: string }) { return <article className={`metric-card ${accent}`}><span>{label}</span><strong>{value}</strong><small>{sub}</small>{detail && <small className="metric-detail" title={detail}>{detail}</small>}</article>; }

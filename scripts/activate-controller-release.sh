@@ -143,18 +143,26 @@ test "$reward_actions_after" = "$reward_actions_before" || { echo "Reward monito
 ln -sfn "$release" "$remote_root/current"
 deadline=$(( $(date +%s) + 600 ))
 caught_up=0
+recovery_required=0
 while [ "$(date +%s)" -le "$deadline" ]; do
-  state="$(docker compose exec -T postgres psql -U guardian -d guardian -Atc "SELECT last_scanned_block||'|'||COALESCE((payload->>'finalized_block')::bigint,0)||'|'||CASE WHEN COALESCE(payload->>'gap','')='' THEN '1' ELSE '0' END FROM reward_monitor_state WHERE id=1")"
+  state="$(docker compose exec -T postgres psql -U guardian -d guardian -Atc "SELECT last_scanned_block||'|'||COALESCE((payload->>'finalized_block')::bigint,0)||'|'||CASE WHEN COALESCE(payload->>'gap','')='' THEN '1' ELSE '0' END||'|'||COALESCE(payload->'recovery'->>'reason','') FROM reward_monitor_state WHERE id=1")"
   old_ifs="$IFS"; IFS='|'; set -- $state; IFS="$old_ifs"
-  cursor="${1:-0}"; finalized="${2:-0}"; gap_clear="${3:-0}"
-  case "$cursor:$finalized:$gap_clear" in *[!0-9:]*) cursor=0; finalized=0; gap_clear=0;; esac
+  cursor="${1:-0}"; finalized="${2:-0}"; gap_clear="${3:-0}"; recovery_reason="${4:-}"
+  case "$cursor:$finalized:$gap_clear" in *[!0-9:]*) cursor=0; finalized=0; gap_clear=0; recovery_reason="";; esac
   if [ "$cursor" -ge "$cursor_validation_floor" ] && [ "$finalized" -ge "$cursor" ] && [ $((finalized-cursor)) -le 16 ] && [ "$gap_clear" -eq 1 ]; then
     caught_up=1
     break
   fi
+  if [ "$recovery_reason" = local_state_pruned ]; then
+    recovery_required=1
+    break
+  fi
   sleep 15
 done
-test "$caught_up" -eq 1 || { echo "Reward cursor did not catch up within 10 minutes." >&2; exit 1; }
+if [ "$caught_up" -ne 1 ] && [ "$recovery_required" -ne 1 ]; then
+  echo "Reward cursor did not catch up within 10 minutes." >&2
+  exit 1
+fi
 reward_actions_final="$(docker compose exec -T postgres psql -U guardian -d guardian -Atc "SELECT count(*) FROM remediation_actions a JOIN incidents i ON i.id=a.incident_id WHERE i.fingerprint LIKE 'reward-%'")"
 test "$reward_actions_final" = "$reward_actions_before" || { echo "Reward catch-up created a remediation action." >&2; exit 1; }
 if [ "$rebase_applied" -eq 1 ]; then
@@ -168,4 +176,8 @@ docker compose ps
 if [ "$rebase_applied" -eq 1 ]; then
   printf 'Operator-approved pruned reward history was acknowledged in the audit log; no reward events were synthesized.\n'
 fi
-printf 'Controller-only release %s activated; reward cursor caught up without credential changes.\n' "$version"
+if [ "$recovery_required" -eq 1 ]; then
+  printf 'WARNING: Controller-only release %s activated, but local reward history is pruned. The cursor was not changed; approve the audited recovery from the Rewards page.\n' "$version" >&2
+else
+  printf 'Controller-only release %s activated; reward cursor caught up without credential changes.\n' "$version"
+fi

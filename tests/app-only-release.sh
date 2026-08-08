@@ -15,6 +15,8 @@ if grep -Fq 'docker compose run --rm --no-deps controller /usr/local/bin/control
   exit 1
 fi
 grep -q 'reward.history_gap.acknowledge' "$activate"
+grep -Fq 'recovery_reason" = local_state_pruned' "$activate"
+grep -Fq 'The cursor was not changed; approve the audited recovery from the Rewards page.' "$activate"
 grep -Fq "SELECT (details->>'from_block')||'|'||(details->>'through_block')" "$activate"
 if grep -Eq 'dbmigrate|rotate-admin|docker compose down|docker compose stop (api|auth-broker|caddy|prometheus|postgres|backup)|bootstrap-host' "$activate"; then
   echo 'App-only activation contains a forbidden migration, non-controller stop, or host bootstrap command.' >&2

@@ -132,7 +132,7 @@ func TestPostgresMigrations(t *testing.T) {
 	if err := store.DB.QueryRowContext(ctx, `SELECT count(*) FROM reward_events`).Scan(&eventsBefore); err != nil {
 		t.Fatal(err)
 	}
-	rebase, err := store.AcknowledgePrunedRewardGap(ctx, 12347, 12447, 12511)
+	rebase, err := store.AcknowledgePrunedRewardGap(ctx, 12347, 12447, 12511, RewardGapApproval{Actor: "admin", Reason: "planned maintenance recovery", ActionID: "act_reward_gap_test"})
 	if err != nil {
 		t.Fatalf("acknowledge pruned reward gap: %v", err)
 	}
@@ -140,14 +140,14 @@ func TestPostgresMigrations(t *testing.T) {
 		t.Fatalf("rebase=%#v", rebase)
 	}
 	loaded, err = store.LoadRewardOverview(ctx)
-	if err != nil || loaded.LastScannedBlock != 12447 || loaded.Sources["historical_gap"] != "acknowledged_pruned_blocks_12348_12447" || loaded.Gap == "" {
+	if err != nil || loaded.LastScannedBlock != 12447 || loaded.Sources["historical_gap"] != "acknowledged_pruned_blocks_12348_12447" || loaded.Gap == "" || loaded.Recovery != nil || loaded.LastHistoryGap == nil || loaded.LastHistoryGap.AcknowledgedBy != "admin" || loaded.LastHistoryGap.HistoryRecovered {
 		t.Fatalf("rebased overview=%#v err=%v", loaded, err)
 	}
 	var auditAction, auditActor, auditResult, auditReason, auditRecovered string
 	if err := store.DB.QueryRowContext(ctx, `SELECT action,actor,result,details->>'reason',details->>'history_recovered' FROM audit_events WHERE id=$1`, rebase.AuditID).Scan(&auditAction, &auditActor, &auditResult, &auditReason, &auditRecovered); err != nil {
 		t.Fatal(err)
 	}
-	if auditAction != "reward.history_gap.acknowledge" || auditActor != "operator-approved-controller-recovery" || auditResult != "acknowledged" || auditReason != "local_state_pruned" || auditRecovered != "false" {
+	if auditAction != "reward.history_gap.acknowledge" || auditActor != "admin" || auditResult != "acknowledged" || auditReason != "local_state_pruned" || auditRecovered != "false" {
 		t.Fatalf("audit=%q %q %q %q %q", auditAction, auditActor, auditResult, auditReason, auditRecovered)
 	}
 	var actionsAfter, eventsAfter int
@@ -160,11 +160,30 @@ func TestPostgresMigrations(t *testing.T) {
 	if actionsAfter != actionsBefore || eventsAfter != eventsBefore {
 		t.Fatalf("rebase changed actions/events: actions %d->%d events %d->%d", actionsBefore, actionsAfter, eventsBefore, eventsAfter)
 	}
-	if _, err := store.AcknowledgePrunedRewardGap(ctx, 12347, 12447, 12511); !errors.Is(err, ErrRewardCursorConflict) {
+	if _, err := store.AcknowledgePrunedRewardGap(ctx, 12347, 12447, 12511, RewardGapApproval{Actor: "admin", Reason: "planned maintenance recovery"}); !errors.Is(err, ErrRewardCursorConflict) {
 		t.Fatalf("replayed rebase err=%v", err)
 	}
 	var auditCount int
 	if err := store.DB.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE action='reward.history_gap.acknowledge'`).Scan(&auditCount); err != nil || auditCount != 1 {
 		t.Fatalf("rebase audit count=%d err=%v", auditCount, err)
+	}
+
+	maxTransitionOverview := loaded
+	maxTransitionOverview.LastScannedBlock = loaded.LastScannedBlock + RewardScanMaxTransitionBlocks
+	if err := store.ApplyRewardScan(ctx, loaded.LastScannedBlock, maxTransitionOverview, nil); err != nil {
+		t.Fatalf("maximum reward cursor transition: %v", err)
+	}
+	loaded, err = store.LoadRewardOverview(ctx)
+	if err != nil || loaded.LastScannedBlock != maxTransitionOverview.LastScannedBlock {
+		t.Fatalf("maximum transition cursor=%d err=%v", loaded.LastScannedBlock, err)
+	}
+	tooFarOverview := loaded
+	tooFarOverview.LastScannedBlock = loaded.LastScannedBlock + RewardScanMaxTransitionBlocks + 1
+	if err := store.ApplyRewardScan(ctx, loaded.LastScannedBlock, tooFarOverview, nil); err == nil {
+		t.Fatal("oversized reward cursor transition unexpectedly committed")
+	}
+	afterTooFar, err := store.LoadRewardOverview(ctx)
+	if err != nil || afterTooFar.LastScannedBlock != loaded.LastScannedBlock {
+		t.Fatalf("oversized transition changed cursor=%d err=%v", afterTooFar.LastScannedBlock, err)
 	}
 }

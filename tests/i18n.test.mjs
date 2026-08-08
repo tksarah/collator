@@ -37,6 +37,8 @@ test("既知インシデントと基本画面の翻訳を含む", async () => {
     "incident.service-inactive",
     "incident.reward-silence.critical",
     "restart.accepted",
+    "rewards.recoveryRequired",
+    "rewardRecovery.accepted",
   ]) {
     assert.ok(en[key], `missing English ${key}`);
     assert.ok(ja[key], `missing Japanese ${key}`);

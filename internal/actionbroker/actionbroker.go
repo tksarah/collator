@@ -20,18 +20,26 @@ import (
 )
 
 const (
-	TimestampHeader = "X-Guardian-Timestamp"
-	NonceHeader     = "X-Guardian-Nonce"
-	SignatureHeader = "X-Guardian-Signature"
-	MaxBodyBytes    = 16 << 10
+	TimestampHeader                  = "X-Guardian-Timestamp"
+	NonceHeader                      = "X-Guardian-Nonce"
+	SignatureHeader                  = "X-Guardian-Signature"
+	MaxBodyBytes                     = 16 << 10
+	ActionRestartService             = "restart_service"
+	ActionAcknowledgePrunedRewardGap = "acknowledge_pruned_reward_gap"
 )
 
 type ManualAction struct {
-	ActionID       string `json:"action_id"`
-	IdempotencyKey string `json:"idempotency_key"`
-	IncidentID     string `json:"incident_id,omitempty"`
-	RequestedBy    string `json:"requested_by"`
-	Reason         string `json:"reason"`
+	ActionID       string          `json:"action_id"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	IncidentID     string          `json:"incident_id,omitempty"`
+	RequestedBy    string          `json:"requested_by"`
+	Reason         string          `json:"reason"`
+	ActionKind     string          `json:"action_kind"`
+	Parameters     json.RawMessage `json:"parameters,omitempty"`
+}
+
+type RewardGapParameters struct {
+	ExpectedCursor int64 `json:"expected_cursor"`
 }
 
 type Result struct {

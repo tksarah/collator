@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shiden-guardian/shiden-guardian/internal/actionbroker"
 	"github.com/shiden-guardian/shiden-guardian/internal/model"
 	"github.com/shiden-guardian/shiden-guardian/internal/reward"
 	"github.com/shiden-guardian/shiden-guardian/internal/store"
@@ -67,7 +69,7 @@ type fakeRewardGapWriter struct {
 	err       error
 }
 
-func (f *fakeRewardGapWriter) AcknowledgePrunedRewardGap(_ context.Context, expected, baseline, finalized int64) (store.RewardGapRebase, error) {
+func (f *fakeRewardGapWriter) AcknowledgePrunedRewardGap(_ context.Context, expected, baseline, finalized int64, _ store.RewardGapApproval) (store.RewardGapRebase, error) {
 	f.calls++
 	f.expected, f.baseline, f.finalized = expected, baseline, finalized
 	return store.RewardGapRebase{AuditID: "aud_test", FromBlock: expected + 1, ThroughBlock: baseline, ResumeFromBlock: baseline + 1, SnapshotFinalizedBlock: finalized}, f.err
@@ -186,24 +188,24 @@ func TestLocalRewardHistoryIsBoundedAndRateLimited(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	previous := model.RewardOverview{LastScannedBlock: 100}
 
-	updated, attempted, err := c.scanLocalRewardHistory(context.Background(), now, previous, 200)
+	updated, attempted, err := c.scanLocalRewardHistory(context.Background(), now, previous, 400)
 	if err != nil || !attempted {
 		t.Fatalf("first scan attempted=%v err=%v", attempted, err)
 	}
-	if updated.LastScannedBlock != 116 || scanner.calls != 1 || writer.calls != 1 || writer.expectedCursor != 100 || writer.writtenCursor != 116 {
+	if updated.LastScannedBlock != 228 || scanner.calls != 1 || writer.calls != 1 || writer.expectedCursor != 100 || writer.writtenCursor != 228 {
 		t.Fatalf("first scan updated=%#v scanner=%d writer=%#v", updated, scanner.calls, writer)
 	}
 	if updated.Gap == "" {
 		t.Fatal("catch-up gap was cleared before reaching finalized")
 	}
 
-	deferred, attempted, err := c.scanLocalRewardHistory(context.Background(), now.Add(14*time.Second), updated, 200)
-	if err != nil || attempted || deferred.LastScannedBlock != 116 || scanner.calls != 1 {
+	deferred, attempted, err := c.scanLocalRewardHistory(context.Background(), now.Add(14*time.Second), updated, 400)
+	if err != nil || attempted || deferred.LastScannedBlock != 228 || scanner.calls != 1 {
 		t.Fatalf("early retry attempted=%v cursor=%d calls=%d err=%v", attempted, deferred.LastScannedBlock, scanner.calls, err)
 	}
 
-	updated, attempted, err = c.scanLocalRewardHistory(context.Background(), now.Add(15*time.Second), updated, 200)
-	if err != nil || !attempted || updated.LastScannedBlock != 132 || scanner.calls != 2 {
+	updated, attempted, err = c.scanLocalRewardHistory(context.Background(), now.Add(15*time.Second), updated, 400)
+	if err != nil || !attempted || updated.LastScannedBlock != 356 || scanner.calls != 2 {
 		t.Fatalf("second scan attempted=%v cursor=%d calls=%d err=%v", attempted, updated.LastScannedBlock, scanner.calls, err)
 	}
 }
@@ -259,6 +261,43 @@ func TestRewardScanBackoffIsBounded(t *testing.T) {
 	}
 }
 
+func TestRewardPruningClassificationAndAdaptiveChunk(t *testing.T) {
+	if !isPrunedRewardStateError(errors.New("agent 503: State already discarded for 0xold")) {
+		t.Fatal("pruned state error was not classified")
+	}
+	if isPrunedRewardStateError(errors.New("connection refused")) {
+		t.Fatal("generic RPC error was classified as pruning")
+	}
+	recovery := rewardRecoveryForScanError(800, 1000, errors.New("rpc 4003: State already discarded"))
+	if recovery == nil || !recovery.Required || recovery.Reason != "local_state_pruned" || recovery.ExpectedCursor != 800 || recovery.CandidateResumeFromBlock != 937 {
+		t.Fatalf("structured recovery=%#v", recovery)
+	}
+	if recovery := rewardRecoveryForScanError(950, 1000, errors.New("State already discarded")); recovery != nil {
+		t.Fatalf("within-window failure became recoverable: %#v", recovery)
+	}
+	if got := rewardScanEnd(100, 150); got != 116 {
+		t.Fatalf("normal scan end=%d", got)
+	}
+	if got := rewardScanEnd(100, 400); got != 228 {
+		t.Fatalf("catch-up scan end=%d", got)
+	}
+}
+
+func TestRewardGapManualActionValidation(t *testing.T) {
+	parameters, err := json.Marshal(actionbroker.RewardGapParameters{ExpectedCursor: 12345})
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := actionbroker.ManualAction{ActionID: "act_reward_gap_validation", IdempotencyKey: "gap-validation", RequestedBy: "admin", Reason: "planned maintenance recovery", ActionKind: actionbroker.ActionAcknowledgePrunedRewardGap, Parameters: parameters}
+	if err := validateManualAction(&action); err != nil {
+		t.Fatalf("valid reward gap action rejected: %v", err)
+	}
+	action.Parameters = json.RawMessage(`{"expected_cursor":0}`)
+	if err := validateManualAction(&action); err == nil {
+		t.Fatal("zero cursor reward gap action was accepted")
+	}
+}
+
 func TestLocalRewardScanRejectsNonLocalEvidence(t *testing.T) {
 	for _, verification := range []string{"confirmed", "confirmed_extra", "insufficient", "pot_empty"} {
 		base := model.RewardScan{
@@ -296,7 +335,7 @@ func TestPrunedRewardGapAcknowledgementRequiresDiscardedAndRetainedLocalState(t 
 		oldErr:   errors.New("rpc 4003: State already discarded for old block"),
 	}
 	writer := &fakeRewardGapWriter{}
-	result, err := acknowledgePrunedRewardGap(context.Background(), authority, writer, 800)
+	result, err := acknowledgePrunedRewardGap(context.Background(), authority, writer, 800, store.RewardGapApproval{Actor: "admin", Reason: "planned maintenance recovery"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +367,7 @@ func TestPrunedRewardGapAcknowledgementRefusesUnsafeEvidence(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			authority := &fakeRewardGapAuthority{snapshot: test.snapshot, oldErr: test.oldErr, probeErr: test.probeErr}
 			writer := &fakeRewardGapWriter{}
-			if _, err := acknowledgePrunedRewardGap(context.Background(), authority, writer, 800); err == nil {
+			if _, err := acknowledgePrunedRewardGap(context.Background(), authority, writer, 800, store.RewardGapApproval{Actor: "admin", Reason: "planned maintenance recovery"}); err == nil {
 				t.Fatal("unsafe acknowledgement succeeded")
 			}
 			if writer.calls != 0 {
