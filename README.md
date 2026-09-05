@@ -80,7 +80,9 @@ Polkadot Telemetryは状況確認用リンクとして使いますが、その�
 4. block前後の残高増分が期待額以上なら確認済みとします。超過分は追加入金として扱い、報酬確認自体は成功です。
 5. 不足やポット枯渇は、同じfinalized block hashについて2ソース以上が一致した場合だけ重大化します。
 
-SDNは小数18桁で、`1 SDN = 10^18 Planck`です。DBでは`numeric(39,0)`、JSONでは10進文字列を使い、JavaScriptの数値精度損失を避けます。対応済みruntime specは`2208`と`2300`です。未知のruntimeやAccountInfo形式を検出した場合、金額判定を止めてfail-closedで「報酬監視劣化」と通知します。
+SDNは小数18桁で、`1 SDN = 10^18 Planck`です。DBでは`numeric(39,0)`、JSONでは10進文字列を使い、JavaScriptの数値精度損失を避けます。対応済みruntime specは`2208`、`2300`、`2400`です。未知のruntimeやAccountInfo形式を検出した場合、金額判定を止めてfail-closedで「報酬監視劣化」と通知します。
+
+2400の互換性は[公式Shiden runtime](https://github.com/AstarNetwork/Astar/blob/runtime-2400/runtime/shiden/src/lib.rs)と[collator-selection](https://github.com/AstarNetwork/Astar/blob/runtime-2400/pallets/collator-selection/src/lib.rs)で確認しています。`System.Account`は80 bytes（先頭16 bytesの管理情報、その後にu128のfree・reserved・frozen・flags）、`LastAuthoredBlock`はTwox64ConcatのAccountIdキーとブロック番号、`Session.Validators`はAccountIdのSCALE vector、`Timestamp.Now`はu64です。[固定されたPolkadot SDK](https://github.com/paritytech/polkadot-sdk/tree/ba6a0d23259cdc3108f70997a6847e7bc5b28794/substrate/frame)のAccountInfo/AccountData定義も照合しています。PotStake口座、最低残高1,000,000 Planck、`floor(max(pot_free - 1,000,000, 0) / 2)`という報酬計算は既存実装と一致します。
 
 導入前の履歴は推測しません。Activation時のfinalized blockを開始点として、以降の証拠だけを保存します。controller停止中はDB cursorから再開し、pruning等で補えない区間は監視gapとして残します。履歴カーソルを進められるのは確定済みローカルRPCだけで、外部RPC単独の結果では進めません。通常走査は15秒に1回・最大16ブロック、cursorが64ブロックを超えて遅延したcatch-up時はローカルRPCの既存上限内で最大128ブロックに拡張します。scannerとDB保存層は同じ128ブロックの共有上限を使い、129ブロック以上の遷移はcursorを変更せず拒否します。RPCまたはDB失敗時は15秒から最大5分までbackoffします。報酬イベントのupsertとcursor更新は同一transactionで行い、競合や1件の保存失敗でも全体をrollbackします。外部RPCはsnapshot quorumと異常候補1ブロックの確認だけに使い、429や停止時は1・2・4・8・15分backoffして「報酬未取得」と誤判定しません。
 
@@ -302,6 +304,84 @@ sudo sh scripts/activate-controller-release.sh \
 このモードは旧cursorの走査がローカルRPCから`State already discarded`で拒否され、同じローカルRPCの最新保持範囲が正常走査できることを確認してから、controllerだけを停止します。`finalized - 64`を再開基準として、破棄済み区間、再開block、`history_recovered=false`、local RPC権威であることを`reward.history_gap.acknowledge`監査へcursor更新と同一transactionで保存します。破棄済み区間の報酬eventを合成せず、`sources.historical_gap`にも永続的な印を残します。通常走査がRPC失敗時にcursorを進めない規則は変更しません。
 
 稼働中に同じ状態を検出した場合は、報酬画面に「監査付きで報酬監視を再開」が表示されます。管理者のpassword、TOTP、理由、画面に示された`PRUNED GAP <cursor>`の入力後、controllerが上記の旧state破棄と最新保持範囲を再検証してから同じtransactionを実行します。このWeb操作も破棄区間のeventを作成せず、24時間・日次・累計には永続的な履歴gapが残ります。CLIモードはWeb経路が利用できない場合のbreak-glass用です。
+
+### ランタイム2400対応の本番反映
+
+`spec_version=2400`、`schema_ok=false`、`unsupported_runtime_schema`の場合、旧Guardianエージェントが2400を拒否しています。controllerだけの更新では直りません。以下は運用者が実行する手順です。DB移行・Astarノード再起動・CLIでの欠損承認は不要です。
+
+1. このPCのWSLで修正版をビルド・転送します。表示されたVERSIONを控えます。この段階では本番サービスは切り替わりません。
+
+```bash
+cd /mnt/c/Users/sarah/Documents/01_MyApp/on_github/collator
+bash scripts/deploy-wsl.sh --controller-only
+```
+
+2. 本番サーバーのroot端末で、`VERSION`を上記の値に置き換えて実行します。旧バイナリ・image・配置先を保存し、新controllerのビルドを済ませてからGuardianエージェントだけを更新します。`bootstrap-host.sh`は今回実行しません。
+
+```bash
+set -e
+version=VERSION
+remote_root=/home/tk/shiden-guardian
+release="$remote_root/releases/$version"
+rollback_dir="$remote_root/backups/reward-runtime-$version"
+test -d "$release"
+mkdir -m 0700 "$rollback_dir"
+readlink -f "$remote_root/current" > "$rollback_dir/previous-release"
+cp -a /usr/local/bin/shiden-guardian-agent "$rollback_dir/agent"
+cd "$remote_root/current"
+docker inspect --format '{{.Image}}' "$(docker compose ps -q controller)" > "$rollback_dir/controller-image"
+docker tag "$(cat "$rollback_dir/controller-image")" "shiden-guardian-controller:reward-runtime-backup-$version"
+cd "$release"
+sh scripts/copy-runtime-config.sh "$remote_root/current"
+docker compose build controller
+(cd release/bin && sha256sum -c shiden-guardian-agent.sha256)
+install -o root -g root -m 0755 release/bin/shiden-guardian-agent /usr/local/bin/shiden-guardian-agent.new
+mv /usr/local/bin/shiden-guardian-agent.new /usr/local/bin/shiden-guardian-agent
+systemctl restart shiden-guardian-agent.service
+systemctl is-active --quiet shiden-guardian-agent.service
+curl -fsS --retry 5 --retry-connrefused --retry-delay 1 --max-time 20 \
+  --unix-socket /run/shiden-guardian/observe/agent.sock \
+  http://localhost/v1/rewards/snapshot
+```
+
+3. 出力が`spec_version:2400`、`schema_ok:true`、`source:"local"`で、確定block/hashが取得できていることを確認します。異なる場合は先へ進まず下記の戻し方を使います。同じroot端末でcontrollerを切り替えます。
+
+```bash
+cd "$release"
+sh scripts/activate-controller-release.sh "$remote_root" "$version"
+```
+
+このスクリプトは保持範囲への追いつき、または`local_state_pruned`の検出まで確認します。エージェントの更新はこのスクリプトより先に行います。スクリプト実行中に他サービスを再起動しないでください。
+
+4. 報酬画面を再読み込みし、最新のcursorに対して「監査付きで報酬監視を再開」を承認します。その後、次のSQLで最新操作が`succeeded`になったことを確認し、最後のSQLを30秒以上あけて再実行してcursorが進むことを確認します。走査バックオフが残っている場合は最大5分待ちます。
+
+```bash
+cd /home/tk/shiden-guardian/current
+docker compose exec -T postgres psql -U guardian -d guardian -x -c "SELECT id,status,result FROM remediation_actions WHERE action_kind='acknowledge_pruned_reward_gap' ORDER BY created_at DESC LIMIT 1;"
+docker compose exec -T postgres psql -U guardian -d guardian -x -c "SELECT last_scanned_block,payload->>'finalized_block' AS finalized_block,payload->>'gap' AS gap,payload->'last_history_gap' AS last_history_gap FROM reward_monitor_state WHERE id=1;"
+```
+
+欠損区間は`history_recovered=false`として永久に記録されます。報酬eventの補完は行いません。再開に失敗した場合は`result.error`と`reward.history_gap.execute`の監査detailsに具体的な理由が保存されます。最新状態の検証エラーにはspec版・取得元・schema判定・block/hashも含まれます。
+
+**更新失敗時の戻し方**（本番root端末。`VERSION`は上記と同じ値）：
+
+```bash
+set -e
+version=VERSION
+remote_root=/home/tk/shiden-guardian
+rollback_dir="$remote_root/backups/reward-runtime-$version"
+previous="$(cat "$rollback_dir/previous-release")"
+test -d "$previous"
+install -o root -g root -m 0755 "$rollback_dir/agent" /usr/local/bin/shiden-guardian-agent.new
+mv /usr/local/bin/shiden-guardian-agent.new /usr/local/bin/shiden-guardian-agent
+systemctl restart shiden-guardian-agent.service
+docker tag "shiden-guardian-controller:reward-runtime-backup-$version" shiden-guardian-controller:latest
+cd "$previous"
+docker compose up -d --no-deps --force-recreate --wait --wait-timeout 90 controller
+ln -sfn "$previous" "$remote_root/current"
+```
+
+旧版へ戻すと2400の未対応状態も戻ります。controller切替失敗時には既存スクリプトがcontrollerを自動rollbackしますが、エージェントは上記手順で戻してください。承認済みの履歴欠損やcursorは巻き戻さず、DBを直接編集しないでください。
 
 ## 日常確認
 

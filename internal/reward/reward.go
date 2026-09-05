@@ -23,7 +23,7 @@ import (
 
 const (
 	ShidenPrefix        = byte(5)
-	CurrentSpecVersion  = int64(2300)
+	CurrentSpecVersion  = int64(2400)
 	AccountInfoBytes    = 80
 	ExistentialDeposit  = int64(1_000_000)
 	KickThresholdBlocks = int64(1200)
@@ -34,7 +34,7 @@ const (
 // layout has been verified. Unknown runtimes remain fail-closed until their
 // AccountInfo and collator-selection layout are reviewed.
 func IsSupportedSpecVersion(version int64) bool {
-	return version == 2208 || version == CurrentSpecVersion
+	return version == 2208 || version == 2300 || version == CurrentSpecVersion
 }
 
 var b58Alphabet = []byte("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")

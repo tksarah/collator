@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -331,7 +332,7 @@ func TestLocalRewardScanRejectsNonLocalEvidence(t *testing.T) {
 
 func TestPrunedRewardGapAcknowledgementRequiresDiscardedAndRetainedLocalState(t *testing.T) {
 	authority := &fakeRewardGapAuthority{
-		snapshot: model.RewardSnapshot{Source: "local", SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"},
+		snapshot: model.RewardSnapshot{Source: "local", SpecVersion: 2400, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"},
 		oldErr:   errors.New("rpc 4003: State already discarded for old block"),
 	}
 	writer := &fakeRewardGapWriter{}
@@ -347,6 +348,45 @@ func TestPrunedRewardGapAcknowledgementRequiresDiscardedAndRetainedLocalState(t 
 	}
 	if result.FromBlock != 801 || result.ThroughBlock != 936 || result.ResumeFromBlock != 937 {
 		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestRewardGapSnapshotFailureDetailsReachAudit(t *testing.T) {
+	for _, field := range []string{"source", "schema_ok", "finalized_block", "finalized_hash"} {
+		t.Run(field, func(t *testing.T) {
+			snapshot := model.RewardSnapshot{Source: "local", SpecVersion: 2400, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"}
+			switch field {
+			case "source":
+				snapshot.Source = "external_1"
+			case "schema_ok":
+				snapshot.SchemaOK = false
+				snapshot.Error = "unsupported_runtime_schema"
+			case "finalized_block":
+				snapshot.FinalizedBlock = 0
+			case "finalized_hash":
+				snapshot.FinalizedHash = ""
+			}
+			authority := &fakeRewardGapAuthority{snapshot: snapshot}
+			writer := &fakeRewardGapWriter{}
+			_, err := acknowledgePrunedRewardGap(t.Context(), authority, writer, 800, store.RewardGapApproval{Actor: "admin", Reason: "recovery"})
+			if err == nil || !strings.Contains(err.Error(), "spec_version=2400") || !strings.Contains(err.Error(), field+"=") || writer.calls != 0 || len(authority.scanCalls) != 0 {
+				t.Fatalf("invalid snapshot advanced recovery: err=%v writer=%#v calls=%v", err, writer, authority.scanCalls)
+			}
+			action := model.RemediationAction{ID: "act_test", ActionKind: actionbroker.ActionAcknowledgePrunedRewardGap, Mode: "manual"}
+			details := actionExecutionAuditDetails(action, err)
+			if details["error"] != err.Error() || details["action_id"] != action.ID || details["action_kind"] != action.ActionKind || details["mode"] != "manual" {
+				t.Fatalf("audit=%#v", details)
+			}
+		})
+	}
+}
+
+func TestRewardGapCursorConflictPropagates(t *testing.T) {
+	authority := &fakeRewardGapAuthority{snapshot: model.RewardSnapshot{Source: "local", SpecVersion: 2400, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"}, oldErr: errors.New("State already discarded")}
+	writer := &fakeRewardGapWriter{err: store.ErrRewardCursorConflict}
+	_, err := acknowledgePrunedRewardGap(t.Context(), authority, writer, 800, store.RewardGapApproval{Actor: "admin", Reason: "recovery"})
+	if !errors.Is(err, store.ErrRewardCursorConflict) || writer.calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, writer.calls)
 	}
 }
 

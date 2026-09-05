@@ -180,7 +180,7 @@ func acknowledgePrunedRewardGap(ctx context.Context, authority rewardGapAuthorit
 		return store.RewardGapRebase{}, fmt.Errorf("local finalized reward snapshot: %w", err)
 	}
 	if snapshot.Source != "local" || !snapshot.SchemaOK || snapshot.FinalizedBlock <= 0 || snapshot.FinalizedHash == "" {
-		return store.RewardGapRebase{}, fmt.Errorf("invalid local finalized reward snapshot")
+		return store.RewardGapRebase{}, fmt.Errorf("invalid local finalized reward snapshot: source=%q (required local), schema_ok=%t (required true), spec_version=%d, finalized_block=%d (required >0), finalized_hash=%q (required nonempty), snapshot_error=%q", snapshot.Source, snapshot.SchemaOK, snapshot.SpecVersion, snapshot.FinalizedBlock, snapshot.FinalizedHash, snapshot.Error)
 	}
 	if snapshot.FinalizedBlock-expectedCursor <= store.RewardGapRetainedWindowBlocks {
 		return store.RewardGapRebase{}, fmt.Errorf("reward cursor is still within the retained recovery window")
@@ -1020,9 +1020,17 @@ func (c *controller) processPendingAction() {
 		}
 	}
 	_, _ = c.store.DB.ExecContext(ctx, `UPDATE remediation_actions SET status=$2,result=$3,finished_at=now() WHERE id=$1`, action.ID, status, store.JSON(result))
-	c.store.Audit(ctx, auditAction, "controller", status, map[string]any{"action_id": action.ID, "action_kind": action.ActionKind, "mode": action.Mode})
+	c.store.Audit(ctx, auditAction, "controller", status, actionExecutionAuditDetails(action, err))
 	_ = c.mail.Send(ctx, subject+" "+status, fmt.Sprintf("ノード: %s\nAction: %s\n種別: %s\n結果: %s\n理由: %s", c.cfg.NodeName, action.ID, action.ActionKind, status, action.Reason))
 }
+func actionExecutionAuditDetails(action model.RemediationAction, err error) map[string]any {
+	details := map[string]any{"action_id": action.ID, "action_kind": action.ActionKind, "mode": action.Mode}
+	if err != nil {
+		details["error"] = err.Error()
+	}
+	return details
+}
+
 func (c *controller) verifyRecovery(ctx context.Context, baseline int64) error {
 	activeDeadline := time.Now().Add(2 * time.Minute)
 	blockDeadline := time.Now().Add(10 * time.Minute)

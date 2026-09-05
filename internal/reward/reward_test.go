@@ -84,7 +84,7 @@ func TestDecodeBlockNumber(t *testing.T) {
 }
 
 func TestSupportedRuntimeVersionsFailClosed(t *testing.T) {
-	for _, version := range []int64{2208, CurrentSpecVersion} {
+	for _, version := range []int64{2208, 2300, 2400} {
 		if !IsSupportedSpecVersion(version) {
 			t.Fatalf("verified runtime %d rejected", version)
 		}
@@ -151,16 +151,53 @@ func TestScanStopsOnUnknownRuntime(t *testing.T) {
 	}
 }
 
+func TestRuntimeSnapshotAndScanCompatibility(t *testing.T) {
+	for _, version := range []int64{2208, 2300, 2400, 2401} {
+		for _, size := range []int{80, 64, 32} {
+			t.Run(fmt.Sprintf("spec_%d_bytes_%d", version, size), func(t *testing.T) {
+				rpc := &scanRPC{runtimeVersion: version, accountBytes: size, walletBefore: big.NewInt(1000), walletAfter: big.NewInt(1241), pot: big.NewInt(1_000_482)}
+				monitor, err := NewMonitor("WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN", "local", rpc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rpc.keys = monitor.Keys
+				snapshot, snapshotErr := monitor.Snapshot(t.Context())
+				valid := version != 2401 && size == 80
+				if valid {
+					if snapshotErr != nil || !snapshot.SchemaOK || snapshot.SpecVersion != version || snapshot.Source != "local" || snapshot.FinalizedBlock != 100 || snapshot.FinalizedHash == "" || !snapshot.ActiveSession || snapshot.WalletFreePlanck != "1241" {
+						t.Fatalf("snapshot=%#v err=%v", snapshot, snapshotErr)
+					}
+				} else if snapshotErr == nil && (snapshot.SchemaOK || snapshot.Error != "unsupported_runtime_schema") {
+					t.Fatalf("unsafe snapshot=%#v", snapshot)
+				}
+				scan, scanErr := monitor.Scan(t.Context(), 100, 100)
+				if valid {
+					if scanErr != nil || len(scan.Observations) != 1 || scan.Observations[0].Verification != "confirmed" || scan.Observations[0].ExpectedPlanck != "241" {
+						t.Fatalf("scan=%#v err=%v", scan, scanErr)
+					}
+				} else if scanErr == nil {
+					t.Fatal("unsafe scan accepted")
+				}
+			})
+		}
+	}
+}
+
 type scanRPC struct {
 	keys                           Keys
 	runtimeVersion                 int64
 	walletBefore, walletAfter, pot *big.Int
+	accountBytes                   int
 }
 
 func (f *scanRPC) Call(_ context.Context, method string, params []any, out any) error {
 	hash99 := fmt.Sprintf("0x%064x", 99)
 	hash100 := fmt.Sprintf("0x%064x", 100)
 	switch method {
+	case "chain_getFinalizedHead":
+		return assignJSON(out, hash100)
+	case "chain_getHeader":
+		return assignJSON(out, map[string]any{"number": "0x64"})
 	case "chain_getBlockHash":
 		block, ok := params[0].(int64)
 		if !ok {
@@ -174,6 +211,8 @@ func (f *scanRPC) Call(_ context.Context, method string, params []any, out any) 
 		hash, _ := params[1].(string)
 		var raw []byte
 		switch {
+		case key == f.keys.Validators:
+			raw = append([]byte{4}, f.keys.AccountID[:]...)
 		case key == f.keys.LastAuthored && hash == hash99:
 			raw = make([]byte, 4)
 			binary.LittleEndian.PutUint32(raw, 90)
@@ -191,6 +230,9 @@ func (f *scanRPC) Call(_ context.Context, method string, params []any, out any) 
 			binary.LittleEndian.PutUint64(raw, 1_722_816_000_000)
 		default:
 			return fmt.Errorf("unexpected storage key=%s hash=%s", key, hash)
+		}
+		if key == f.keys.WalletAccount && f.accountBytes > 0 {
+			raw = raw[:f.accountBytes]
 		}
 		return assignJSON(out, "0x"+hex.EncodeToString(raw))
 	default:
