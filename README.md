@@ -80,9 +80,11 @@ Polkadot Telemetryは状況確認用リンクとして使いますが、その�
 4. block前後の残高増分が期待額以上なら確認済みとします。超過分は追加入金として扱い、報酬確認自体は成功です。
 5. 不足やポット枯渇は、同じfinalized block hashについて2ソース以上が一致した場合だけ重大化します。
 
-SDNは小数18桁で、`1 SDN = 10^18 Planck`です。DBでは`numeric(39,0)`、JSONでは10進文字列を使い、JavaScriptの数値精度損失を避けます。対応済みruntime specは`2208`、`2300`、`2400`です。未知のruntimeやAccountInfo形式を検出した場合、金額判定を止めてfail-closedで「報酬監視劣化」と通知します。
+SDNは小数18桁で、`1 SDN = 10^18 Planck`です。DBでは`numeric(39,0)`、JSONでは10進文字列を使い、JavaScriptの数値精度損失を避けます。対応済みruntime specは`2208`、`2300`、`2400`、`2500`です。未知のruntimeやAccountInfo形式を検出した場合、金額判定を止めてfail-closedで「報酬監視劣化」と通知します。
 
 2400の互換性は[公式Shiden runtime](https://github.com/AstarNetwork/Astar/blob/runtime-2400/runtime/shiden/src/lib.rs)と[collator-selection](https://github.com/AstarNetwork/Astar/blob/runtime-2400/pallets/collator-selection/src/lib.rs)で確認しています。`System.Account`は80 bytes（先頭16 bytesの管理情報、その後にu128のfree・reserved・frozen・flags）、`LastAuthoredBlock`はTwox64ConcatのAccountIdキーとブロック番号、`Session.Validators`はAccountIdのSCALE vector、`Timestamp.Now`はu64です。[固定されたPolkadot SDK](https://github.com/paritytech/polkadot-sdk/tree/ba6a0d23259cdc3108f70997a6847e7bc5b28794/substrate/frame)のAccountInfo/AccountData定義も照合しています。PotStake口座、最低残高1,000,000 Planck、`floor(max(pot_free - 1,000,000, 0) / 2)`という報酬計算は既存実装と一致します。
+
+2500は[公式Shiden runtime](https://github.com/AstarNetwork/Astar/blob/runtime-2500/runtime/shiden/src/lib.rs)と[collator-selection](https://github.com/AstarNetwork/Astar/blob/runtime-2500/pallets/collator-selection/src/lib.rs)を2400と比較しています。collator-selectionのソースは同一で、PotStake口座・最低残高・報酬計算・LastAuthoredBlock形式に変更はありません。AccountData、Session、Timestampの設定と、Cargo.lockで固定されたPolkadot SDK commitも同じため、80 bytesのAccountInfo形式は引き続き対応します。2500のsnapshot・走査・2400から2500への境界走査を検証し、未知の2401/2501や不正なAccountInfo長は引き続き拒否します。
 
 導入前の履歴は推測しません。Activation時のfinalized blockを開始点として、以降の証拠だけを保存します。controller停止中はDB cursorから再開し、pruning等で補えない区間は監視gapとして残します。履歴カーソルを進められるのは確定済みローカルRPCだけで、外部RPC単独の結果では進めません。通常走査は15秒に1回・最大16ブロック、cursorが64ブロックを超えて遅延したcatch-up時はローカルRPCの既存上限内で最大128ブロックに拡張します。scannerとDB保存層は同じ128ブロックの共有上限を使い、129ブロック以上の遷移はcursorを変更せず拒否します。RPCまたはDB失敗時は15秒から最大5分までbackoffします。報酬イベントのupsertとcursor更新は同一transactionで行い、競合や1件の保存失敗でも全体をrollbackします。外部RPCはsnapshot quorumと異常候補1ブロックの確認だけに使い、429や停止時は1・2・4・8・15分backoffして「報酬未取得」と誤判定しません。
 
@@ -305,9 +307,9 @@ sudo sh scripts/activate-controller-release.sh \
 
 稼働中に同じ状態を検出した場合は、報酬画面に「監査付きで報酬監視を再開」が表示されます。管理者のpassword、TOTP、理由、画面に示された`PRUNED GAP <cursor>`の入力後、controllerが上記の旧state破棄と最新保持範囲を再検証してから同じtransactionを実行します。このWeb操作も破棄区間のeventを作成せず、24時間・日次・累計には永続的な履歴gapが残ります。CLIモードはWeb経路が利用できない場合のbreak-glass用です。
 
-### ランタイム2400対応の本番反映
+### ランタイム2500対応の本番反映
 
-`spec_version=2400`、`schema_ok=false`、`unsupported_runtime_schema`の場合、旧Guardianエージェントが2400を拒否しています。controllerだけの更新では直りません。以下は運用者が実行する手順です。DB移行・Astarノード再起動・CLIでの欠損承認は不要です。
+`spec_version=2500`、`schema_ok=false`、`unsupported_runtime_schema`の場合、旧Guardianエージェントが2500を拒否しています。controllerだけの更新では直りません。以下は運用者が実行する手順です。DB移行・Astarノード再起動・CLIでの欠損承認は不要です。
 
 1. このPCのWSLで修正版をビルド・転送します。表示されたVERSIONを控えます。この段階では本番サービスは切り替わりません。
 
@@ -344,7 +346,7 @@ curl -fsS --retry 5 --retry-connrefused --retry-delay 1 --max-time 20 \
   http://localhost/v1/rewards/snapshot
 ```
 
-3. 出力が`spec_version:2400`、`schema_ok:true`、`source:"local"`で、確定block/hashが取得できていることを確認します。異なる場合は先へ進まず下記の戻し方を使います。同じroot端末でcontrollerを切り替えます。
+3. 出力が`spec_version:2500`、`schema_ok:true`、`source:"local"`で、確定block/hashが取得できていることを確認します。異なる場合は先へ進まず下記の戻し方を使います。同じroot端末でcontrollerを切り替えます。
 
 ```bash
 cd "$release"
@@ -381,7 +383,7 @@ docker compose up -d --no-deps --force-recreate --wait --wait-timeout 90 control
 ln -sfn "$previous" "$remote_root/current"
 ```
 
-旧版へ戻すと2400の未対応状態も戻ります。controller切替失敗時には既存スクリプトがcontrollerを自動rollbackしますが、エージェントは上記手順で戻してください。承認済みの履歴欠損やcursorは巻き戻さず、DBを直接編集しないでください。
+旧版へ戻すと2500の未対応状態も戻ります。controller切替失敗時には既存スクリプトがcontrollerを自動rollbackしますが、エージェントは上記手順で戻してください。承認済みの履歴欠損やcursorは巻き戻さず、DBを直接編集しないでください。
 
 ## 日常確認
 

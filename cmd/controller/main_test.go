@@ -332,7 +332,7 @@ func TestLocalRewardScanRejectsNonLocalEvidence(t *testing.T) {
 
 func TestPrunedRewardGapAcknowledgementRequiresDiscardedAndRetainedLocalState(t *testing.T) {
 	authority := &fakeRewardGapAuthority{
-		snapshot: model.RewardSnapshot{Source: "local", SpecVersion: 2400, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"},
+		snapshot: model.RewardSnapshot{Source: "local", SpecVersion: 2500, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"},
 		oldErr:   errors.New("rpc 4003: State already discarded for old block"),
 	}
 	writer := &fakeRewardGapWriter{}
@@ -354,7 +354,7 @@ func TestPrunedRewardGapAcknowledgementRequiresDiscardedAndRetainedLocalState(t 
 func TestRewardGapSnapshotFailureDetailsReachAudit(t *testing.T) {
 	for _, field := range []string{"source", "schema_ok", "finalized_block", "finalized_hash"} {
 		t.Run(field, func(t *testing.T) {
-			snapshot := model.RewardSnapshot{Source: "local", SpecVersion: 2400, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"}
+			snapshot := model.RewardSnapshot{Source: "local", SpecVersion: 2500, SchemaOK: true, FinalizedBlock: 1000, FinalizedHash: "0xfinalized"}
 			switch field {
 			case "source":
 				snapshot.Source = "external_1"
@@ -369,7 +369,7 @@ func TestRewardGapSnapshotFailureDetailsReachAudit(t *testing.T) {
 			authority := &fakeRewardGapAuthority{snapshot: snapshot}
 			writer := &fakeRewardGapWriter{}
 			_, err := acknowledgePrunedRewardGap(t.Context(), authority, writer, 800, store.RewardGapApproval{Actor: "admin", Reason: "recovery"})
-			if err == nil || !strings.Contains(err.Error(), "spec_version=2400") || !strings.Contains(err.Error(), field+"=") || writer.calls != 0 || len(authority.scanCalls) != 0 {
+			if err == nil || !strings.Contains(err.Error(), "spec_version=2500") || !strings.Contains(err.Error(), field+"=") || writer.calls != 0 || len(authority.scanCalls) != 0 {
 				t.Fatalf("invalid snapshot advanced recovery: err=%v writer=%#v calls=%v", err, writer, authority.scanCalls)
 			}
 			action := model.RemediationAction{ID: "act_test", ActionKind: actionbroker.ActionAcknowledgePrunedRewardGap, Mode: "manual"}

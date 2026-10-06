@@ -84,13 +84,15 @@ func TestDecodeBlockNumber(t *testing.T) {
 }
 
 func TestSupportedRuntimeVersionsFailClosed(t *testing.T) {
-	for _, version := range []int64{2208, 2300, 2400} {
+	for _, version := range []int64{2208, 2300, 2400, 2500} {
 		if !IsSupportedSpecVersion(version) {
 			t.Fatalf("verified runtime %d rejected", version)
 		}
 	}
-	if IsSupportedSpecVersion(CurrentSpecVersion + 1) {
-		t.Fatal("unknown runtime accepted")
+	for _, version := range []int64{0, 2401, 2501} {
+		if IsSupportedSpecVersion(version) {
+			t.Fatalf("unknown runtime %d accepted", version)
+		}
 	}
 }
 
@@ -151,9 +153,34 @@ func TestScanStopsOnUnknownRuntime(t *testing.T) {
 	}
 }
 
+func TestScanAcrossRuntime2400Upgrade(t *testing.T) {
+	for _, nextVersion := range []int64{2500, 2501} {
+		t.Run(fmt.Sprintf("to_%d", nextVersion), func(t *testing.T) {
+			rpc := &scanRPC{
+				runtimeVersion:  2400,
+				runtimeVersions: map[string]int64{fmt.Sprintf("0x%064x", 100): nextVersion},
+				walletBefore:    big.NewInt(1000), walletAfter: big.NewInt(1241), pot: big.NewInt(1_000_482),
+			}
+			monitor, err := NewMonitor("WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN", "local", rpc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rpc.keys = monitor.Keys
+			scan, err := monitor.Scan(t.Context(), 100, 100)
+			if nextVersion == 2500 {
+				if err != nil || len(scan.Observations) != 1 || scan.Observations[0].Verification != "confirmed" || scan.Observations[0].ExpectedPlanck != "241" || scan.Observations[0].CreditedPlanck != "241" {
+					t.Fatalf("upgrade scan=%#v err=%v", scan, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "unsupported runtime spec 2501") || len(scan.Observations) != 0 {
+				t.Fatalf("unknown upgrade scan=%#v err=%v", scan, err)
+			}
+		})
+	}
+}
+
 func TestRuntimeSnapshotAndScanCompatibility(t *testing.T) {
-	for _, version := range []int64{2208, 2300, 2400, 2401} {
-		for _, size := range []int{80, 64, 32} {
+	for _, version := range []int64{2208, 2300, 2400, 2500, 2401, 2501} {
+		for _, size := range []int{80, 64, 32, 96} {
 			t.Run(fmt.Sprintf("spec_%d_bytes_%d", version, size), func(t *testing.T) {
 				rpc := &scanRPC{runtimeVersion: version, accountBytes: size, walletBefore: big.NewInt(1000), walletAfter: big.NewInt(1241), pot: big.NewInt(1_000_482)}
 				monitor, err := NewMonitor("WGYDjFY3JSijqBMkKEv7qfWU6XaRnmzigQG7B6G1zh7jBzN", "local", rpc)
@@ -162,7 +189,7 @@ func TestRuntimeSnapshotAndScanCompatibility(t *testing.T) {
 				}
 				rpc.keys = monitor.Keys
 				snapshot, snapshotErr := monitor.Snapshot(t.Context())
-				valid := version != 2401 && size == 80
+				valid := version != 2401 && version != 2501 && size == 80
 				if valid {
 					if snapshotErr != nil || !snapshot.SchemaOK || snapshot.SpecVersion != version || snapshot.Source != "local" || snapshot.FinalizedBlock != 100 || snapshot.FinalizedHash == "" || !snapshot.ActiveSession || snapshot.WalletFreePlanck != "1241" {
 						t.Fatalf("snapshot=%#v err=%v", snapshot, snapshotErr)
@@ -186,6 +213,7 @@ func TestRuntimeSnapshotAndScanCompatibility(t *testing.T) {
 type scanRPC struct {
 	keys                           Keys
 	runtimeVersion                 int64
+	runtimeVersions                map[string]int64
 	walletBefore, walletAfter, pot *big.Int
 	accountBytes                   int
 }
@@ -205,6 +233,9 @@ func (f *scanRPC) Call(_ context.Context, method string, params []any, out any) 
 		}
 		return assignJSON(out, fmt.Sprintf("0x%064x", block))
 	case "state_getRuntimeVersion":
+		if version, ok := f.runtimeVersions[params[0].(string)]; ok {
+			return assignJSON(out, map[string]any{"specVersion": version})
+		}
 		return assignJSON(out, map[string]any{"specVersion": f.runtimeVersion})
 	case "state_getStorage":
 		key, _ := params[0].(string)
@@ -232,7 +263,9 @@ func (f *scanRPC) Call(_ context.Context, method string, params []any, out any) 
 			return fmt.Errorf("unexpected storage key=%s hash=%s", key, hash)
 		}
 		if key == f.keys.WalletAccount && f.accountBytes > 0 {
-			raw = raw[:f.accountBytes]
+			resized := make([]byte, f.accountBytes)
+			copy(resized, raw)
+			raw = resized
 		}
 		return assignJSON(out, "0x"+hex.EncodeToString(raw))
 	default:
